@@ -115,3 +115,31 @@ class WaitlistRegistrationRequest(BaseModel):
     # Register a pending application into the FIFO standby queue while the
     # band is busy.  The body is optional; ``reason`` is purely informational.
     reason: str = Field(default="", max_length=2000)
+
+
+class RestrictionWindowRequest(BaseModel):
+    # A temporary spectrum-control window proposal (used by both the
+    # read-only rehearsal preview and the confirming activation): coverage
+    # circle, closed frequency band and half-open UTC interval, plus an
+    # operator reason.  Geometry/band/time validation (including the
+    # not-already-expired rule) runs in semantic_validation so failures use
+    # the standard error envelope.
+    circle: CircleIn
+    frequency: FrequencyBandIn
+    time_window: TimeWindowIn
+    reason: str = Field(default="", max_length=2000)
+
+
+class RestrictionWindowConfirmRequest(RestrictionWindowRequest):
+    # Activate a rehearsed window: the same proposal plus the expected
+    # revision (from the preview/current revision).  Shares revision
+    # arbitration with every other writer and consumes exactly one revision.
+    expected_revision: int = Field(ge=0)
+
+
+class RestrictionWindowReleaseRequest(BaseModel):
+    # Release a previously confirmed window by its id and the expected
+    # revision.  Only later adjudication is affected; the waitlist is not
+    # auto-approved.  Consumes exactly one revision.
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=2000)

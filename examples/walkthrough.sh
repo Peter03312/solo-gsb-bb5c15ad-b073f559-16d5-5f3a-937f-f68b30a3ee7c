@@ -234,3 +234,83 @@ post "/api/applications/$X_ID/revoke" '{"reason":"moved away"}' | python3 -c 'im
 echo "== 37. resume C (revision 19): ordinary resume, never drains a queue =="
 post "/api/applications/$C_ID/resume" '{"expected_revision":18,"reason":"fault cleared"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("resumed revision", d["revision"], "; waitlist keys present:", "auto_approved_application_ids" in d)'
 curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("queue is now", d["waitlist_application_ids"], "at revision", d["current_revision"])'
+
+echo "== 38. restriction window: rehearsal preview (read-only, no revision) =="
+echo "    set the scene in a future-day window 2030-10-01 13:00-14:00:"
+echo "    effective license J [100,110], standby K [106,107], clean standby L [200,210]"
+mkfuture() { post /api/applications "{
+  \"name\":\"$1\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":1000},
+  \"frequency\":{\"low\":$2,\"high\":$3},
+  \"time_window\":{\"start\":\"2030-10-01T13:00:00Z\",\"end\":\"2030-10-01T14:00:00Z\"}
+}"; }
+J=$(mkfuture "Future J" 100 110); J_ID=$(echo "$J" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/applications/$J_ID/approve" "{\"expected_revision\":$REV}" >/dev/null
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+K=$(mkfuture "Future K" 106 107); K_ID=$(echo "$K" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+L=$(mkfuture "Future L" 200 210); L_ID=$(echo "$L" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$K_ID/waitlist" '{}' >/dev/null
+post "/api/applications/$L_ID/waitlist" '{}' >/dev/null
+WINDOW='{
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":105,"high":108},
+  "time_window":{"start":"2030-10-01T13:00:00Z","end":"2030-10-01T14:00:00Z"},
+  "reason":"VIP visit restriction"
+}'
+echo "    rehearsal lists the hit effective license and the hit standby (no mutation):"
+post /api/restriction-windows/preview "$WINDOW" | J
+post /api/restriction-windows/preview "$WINDOW" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("hit effective:", d["hit_effective_application_ids"], "hit waitlist:", d["hit_waitlist_application_ids"])'
+echo "    touching band endpoints hit, but a gap inside the guard band does not:"
+post /api/restriction-windows/preview "$(echo "$WINDOW" | sed 's/"low":105,"high":108/"low":110,"high":120/')" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("window [110,120] hits effective:", d["hit_effective_application_ids"])'
+post /api/restriction-windows/preview "$(echo "$WINDOW" | sed 's/"low":105,"high":108/"low":111,"high":112/')" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("window [111,112] (1 MHz gap to J [100,110]) hits:", d["hit_effective_application_ids"], "(guard band never extends a window)")'
+echo "    an already-expired proposal is rejected 422 (nothing changes):"
+post /api/restriction-windows/preview '{"circle":{"cx":0,"cy":0,"radius":1000},"frequency":{"low":105,"high":108},"time_window":{"start":"2000-01-01T00:00:00Z","end":"2000-01-01T01:00:00Z"}}' \
+  | python3 -c 'import json,sys; print([d["code"] for d in json.load(sys.stdin)["error"]["details"]])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print("current_revision is still", json.load(sys.stdin)["current_revision"])'
+
+echo "== 39. confirm the window (expected = current revision); existing licenses stay effective =="
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post /api/restriction-windows "$(echo "$WINDOW" | sed 's/}$/,"expected_revision":'$REV'}/')" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("activated:", d["activated"], "window_id:", d["window_id"], "revision:", d["revision"])
+print("hit effective:", d["hit_effective_application_ids"], "hit waitlist:", d["hit_waitlist_application_ids"])'
+W_ID=$(curl -s "$BASE/api/restriction-windows" | python3 -c 'import json,sys; print(json.load(sys.stdin)["active_restriction_window_ids"][0])')
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("J still effective:", '$J_ID' in d["effective_application_ids"], "; active windows:", d["active_restriction_window_ids"])'
+ACT_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+
+echo "== 40. window blocks writes: pending preview flags it; approve/resume get 409 restriction_window =="
+post "/api/applications/$K_ID/preview" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("K has (license) conflicts:", d["has_conflicts"], "; has window conflicts:", d["has_restriction_window_conflicts"], "; windows:", d["active_restriction_window_ids"], "(both reported separately)")'
+post "/api/applications/$K_ID/approve" "{\"expected_revision\":$ACT_REV}" | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("code:", e["code"], "; hit windows:", len(e["details"]["restriction_window_conflicts"]))' || true
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print("revision unchanged at", json.load(sys.stdin)["current_revision"])'
+curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("queue (K kept, L still queued):", d["waitlist_application_ids"])'
+
+echo "== 41. release J frees the band: K now passes licenses but hits the window -> stays; L auto-approved =="
+post "/api/applications/$J_ID/revoke" '{"reason":"free up"}' | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("revoke revision:", d["revision"], "final:", d["final_revision"])
+print("auto approved:", d["auto_approved_application_ids"], "(L clean); kept waiting:", d["remaining_waitlist_application_ids"], "(K hits window)")
+print("K pending reason keys:", sorted(d["waitlist_pending"][0].keys()))'
+
+echo "== 42. available-ranges exclude the window closed forbidden lower-bound interval =="
+post "/api/applications/$K_ID/available-ranges" '{"candidate_low_min":100,"candidate_low_max":115}' \
+  | python3 -c 'import json,sys; print([(r["min"],r["max"],r["min_inclusive"],r["max_inclusive"]) for r in json.load(sys.stdin)["available_ranges"]])'
+echo "    (window [105,108], K width 1 -> closed forbidden x in [104,108]; both endpoints unattainable)"
+
+echo "== 43. release the window: only later adjudication changes, no waitlist drain =="
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/restriction-windows/$W_ID/release" "{\"expected_revision\":$REV,\"reason\":\"control ended\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("released:", d["released"], "revision:", d["revision"])'
+REL_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/restriction-windows/$W_ID/release" "{\"expected_revision\":$REL_REV}" | python3 -c 'import json,sys; print("double release ->", json.load(sys.stdin)["error"]["code"])' || true
+curl -s "$BASE/api/restriction-windows/999999" | python3 -c 'import json,sys; print("unknown window ->", json.load(sys.stdin)["error"]["code"])'
+curl -s "$BASE/api/revision/$ACT_REV" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev", d["revision"], "active windows:", d["active_restriction_window_ids"], "; events:", [(e["event_type"],e["window_id"]) for e in d["restriction_window_events"]])'
+curl -s "$BASE/api/revision/compare?base_revision=$ACT_REV&target_revision=$REL_REV" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("window removed:", d["active_restriction_window_ids"]["removed"], "; event types:", [e["type"] for e in d["restriction_window_events"]])'
+curl -s "$BASE/api/restriction-windows?include_inactive=true" | python3 -c 'import json,sys; d=json.load(sys.stdin); w=d["released_windows"][0]; print("released window:", w["id"], w["status"], w["activated_at_revision"], "->", w["released_at_revision"])'
+echo "    release did not auto-approve K; it is still queued and pending:"
+curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; print("queue:", json.load(sys.stdin)["waitlist_application_ids"])'
+post "/api/applications/$K_ID/approve" "{\"expected_revision\":$REL_REV}" | python3 -c 'import json,sys; print("after release, approving K now succeeds at revision", json.load(sys.stdin)["revision"])'

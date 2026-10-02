@@ -6,8 +6,14 @@ violated rule.
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
+from typing import Any
 
-from .schemas import ApplicationCreate, AvailableRangesRequest
+from .schemas import (
+    ApplicationCreate,
+    AvailableRangesRequest,
+    RestrictionWindowRequest,
+)
 
 RADIUS_NOT_POSITIVE = "radius_not_positive"
 FREQUENCY_LOW_ABOVE_HIGH = "frequency_low_above_high"
@@ -16,17 +22,30 @@ VALUE_NOT_FINITE = "value_not_finite"
 NAIVE_DATETIME = "naive_datetime"
 GUARD_BAND_NEGATIVE = "guard_band_negative"
 CANDIDATE_LOW_MIN_ABOVE_MAX = "candidate_low_min_above_max"
+RESTRICTION_WINDOW_EXPIRED = "restriction_window_expired"
 
 
-def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
+def _shape_errors(
+    circle: Any,
+    frequency: Any,
+    time_window: Any,
+    *,
+    radius_field: str = "circle.radius",
+) -> list[dict[str, str]]:
+    """Shared geometry/band/half-open-time validation.
+
+    Used by both application submission and restriction-window proposals:
+    the two shapes carry identical constraints (finite coordinates, strictly
+    positive radius, ordered closed frequency band, aware half-open time).
+    """
     errors: list[dict[str, str]] = []
 
     numbers = {
-        "circle.cx": payload.circle.cx,
-        "circle.cy": payload.circle.cy,
-        "circle.radius": payload.circle.radius,
-        "frequency.low": payload.frequency.low,
-        "frequency.high": payload.frequency.high,
+        "circle.cx": circle.cx,
+        "circle.cy": circle.cy,
+        radius_field: circle.radius,
+        "frequency.low": frequency.low,
+        "frequency.high": frequency.high,
     }
     for field, value in numbers.items():
         if not math.isfinite(value):
@@ -38,16 +57,16 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
                 }
             )
 
-    if payload.circle.radius <= 0:
+    if circle.radius <= 0:
         errors.append(
             {
-                "field": "circle.radius",
+                "field": radius_field,
                 "code": RADIUS_NOT_POSITIVE,
                 "message": "radius must be strictly positive",
             }
         )
 
-    if payload.frequency.low > payload.frequency.high:
+    if frequency.low > frequency.high:
         errors.append(
             {
                 "field": "frequency.low",
@@ -56,8 +75,8 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
             }
         )
 
-    start = payload.time_window.start
-    end = payload.time_window.end
+    start = time_window.start
+    end = time_window.end
     if start.tzinfo is None or end.tzinfo is None:
         errors.append(
             {
@@ -76,6 +95,42 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
             }
         )
 
+    return errors
+
+
+def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
+    return _shape_errors(payload.circle, payload.frequency, payload.time_window)
+
+
+def validate_restriction_window(
+    payload: RestrictionWindowRequest, *, now: datetime | None = None
+) -> list[dict[str, str]]:
+    """Validate a restriction-window proposal.
+
+    Beyond the shared shape rules a window may not already be expired at
+    confirmation/preview time: its half-open interval must extend past the
+    current UTC instant (``end == now`` is already expired).  Windows that
+    start in the past but are still ongoing are allowed (the control starts
+    immediately).  An expired proposal is refused as an illegal range without
+    touching licenses, the queue or the revision.
+    """
+    errors = _shape_errors(
+        payload.circle, payload.frequency, payload.time_window
+    )
+    start, end = payload.time_window.start, payload.time_window.end
+    if start.tzinfo is not None and end.tzinfo is not None and start < end:
+        current = now if now is not None else datetime.now(timezone.utc)
+        if end <= current.astimezone(timezone.utc):
+            errors.append(
+                {
+                    "field": "time_window.end",
+                    "code": RESTRICTION_WINDOW_EXPIRED,
+                    "message": (
+                        "restriction window time_window must end in the future "
+                        "(a half-open interval ending at or before now is expired)"
+                    ),
+                }
+            )
     return errors
 
 

@@ -40,6 +40,17 @@
   修订号，响应列出本次自动获批与仍候补的申请 ID、未获批的冲突明细及最终修订号；
   释放失败或事务回滚时队列、许可与修订号均不变。历史按各修订号逐项还原自动审批
   结果（标记 `auto_approved` 与触发它的释放修订号）
+- **临时频谱管制窗口**：运营人员以**覆盖圆 + 频率闭区间 + UTC 左闭右开时段 + 原因
+  + 预期修订号**先做只读**预演**（列出命中的当前有效许可与候补申请及所据修订号，
+  不改状态），再**确认**启用窗口（占一个修订号）。窗口与申请的圆、时段、频段
+  **三者都相交才命中**——频段端点相碰算相交、时段端点相接不算、圆相切算相交；
+  **保护带宽不扩张窗口**。确认后**既有有效许可继续有效**，但从该修订起，待审预览、
+  单笔/整组批准、暂停恢复与释放后的候补自动审批都报告命中窗口，**写操作不得使
+  命中申请生效**（未命中者照常处理）。可凭**窗口 ID 与预期修订号解除**：解除再占
+  一个修订号，**只影响后续裁决、不主动审批候补**。启用/解除与所有既有写操作
+  **共用同一修订号仲裁**；已过期窗口、非法范围与无效窗口 ID 一律拒绝且不改许可、
+  队列和修订号。历史修订查询与对比按各修订号**还原当时的管制窗口及其启用/解除
+  变动**，原批准事件不追改
 
 ---
 
@@ -86,7 +97,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 124 个用例）：
+运行测试（自动使用临时 SQLite 库，共 170+ 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -230,6 +241,77 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 - 候补登记/取消虽不改修订号，但同样在单行修订号锁上排队，与释放事务串行，
   因此登记绝不会与正在进行的自动重裁互相穿插。
 
+### 临时频谱管制窗口（预演 → 确认 → 解除）
+
+运营人员对某片区域做临时频谱管制时，先以与申请相同的三元形状（覆盖圆、频率闭区间、
+UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当前修订号确认。
+
+**命中判定（窗口与申请/许可三者都相交）**
+
+1. 覆盖圆相交（圆心距 ≤ 半径和，**相切算相交**）；
+2. UTC 左闭右开时段相交（一端结束恰为另一端开始**不算**）；
+3. 频率**闭区间相交**（端点相碰**算相交**）。
+
+**保护带宽不扩张禁用范围**：频段不相交时，即使最短间隔小于保护带宽也**不命中**
+（这是窗口与许可干扰裁决的唯一区别）。
+
+**两步操作**
+
+- `POST /api/restriction-windows/preview`，请求体
+  `{"circle": ..., "frequency": ..., "time_window": ..., "reason": "..."}`：
+  **不改任何状态、不占修订号**。返回当前修订号 `current_revision`（确认时作为
+  `expected_revision`）、命 中的**当前有效许可** `hit_effective`
+  （及 `hit_effective_application_ids`）与**候补申请** `hit_waitlist`
+  （含各自排队位置及 `hit_waitlist_application_ids`），每项附三维触发标志。
+- `POST /api/restriction-windows`，请求体在预演字段外追加
+  `{"expected_revision": n}`：与所有既有写操作**共用同一修订号锁**。修订号过期 →
+  409 `stale_revision`；通过则窗口立即生效、**占一个修订号**，响应给出稳定的
+  `window_id` / `id`、窗口生效修订号，并在锁内重列一遍命中对象。窗口生效时
+  **命中的既有有效许可继续有效**（不被撤销、不退出有效集合），但自该修订起：
+  - 待审 `preview` 追加 `has_restriction_window_conflicts` 与
+    `restriction_window_conflicts[]`（原 `has_conflicts` / `conflicts[]` 仍只表示
+    许可干扰，字段与错误结构保持兼容）；
+  - 单笔与整组批准、暂停许可的**恢复**都会报告命中窗口并返回
+    **409 `restriction_window`**，许可不生效、申请仍 pending、**不占修订号**
+    （整组中命中窗口的成员在 `details.applications[].restriction_window_conflicts`
+    中列出，整组不批准；若同组还存在普通许可干扰则仍返回 `interference`）；
+  - 暂停/撤销释放后的**候补自动审批**逐项重裁时同样检查窗口：命中窗口者**保留
+    队列、继续检查后项**（`waitlist_pending[].restriction_window_conflicts` 给出
+    命中窗口）；
+  - **可用调频位置查询**把每个相交窗口的频段作为**额外的闭禁区**
+    `[window_low - w, window_high]`（两端都不可取，不被保护带宽加宽），即可用调频
+    范围排除会命中窗口的位置。
+  - 窗口只影响**会让许可生效的写操作**：暂停、撤销、带宽变更、候补登记/取消不受
+    窗口限制。
+- `POST /api/restriction-windows/{id}/release`，请求体
+  `{"expected_revision": n, "reason": "..."}`：**解除**窗口，再占一个修订号。
+  解除**只影响后续裁决**——窗口移走后新的预览/批准/恢复/候补重裁不再受它阻挡，
+  但解除本身**不主动审批候补**（候补要等下一次暂停/撤销释放，或手动批准）。
+  未知窗口 ID → 404 `restriction_window_not_found`；重复解除 →
+  409 `restriction_window_not_active`；修订号过期 → 409 `stale_revision`
+  （三种拒绝都不占修订号、不改许可与队列）。
+
+**校验与非法范围**：窗口的圆/频段/时段沿用申请的整笔语义校验（`radius_not_positive`、
+`frequency_low_above_high`、`time_start_not_before_end`、`value_not_finite`、
+`naive_datetime`，一次返回全部违例，422 `validation_failed`）。此外**确认或预演时
+已过期的窗口**（左闭右开时段的 `end <= 当前 UTC 时刻`；已开始但尚未结束的窗口
+允许）以明细码 `restriction_window_expired` 拒绝。任何非法/过期/无效请求都**不改变
+许可、候补队列与修订号**。
+
+**查询与历史**
+
+- `GET /api/restriction-windows` 仅列**当前生效**窗口（`active_windows`）；
+  加 `?include_inactive=true`（或 `?status=released` / `?status=all`）同时从事件流
+  还原**已解除**窗口（附 `activated_at_revision` / `released_at_revision`）。
+- `GET /api/restriction-windows/{id}` 查单个窗口（生效中或已解除；从未存在 → 404）。
+- 每次启用/解除各写一条不可变事件（`restriction_window_events`，占各自的修订号）。
+  `GET /api/revision/{n}` 与 `/api/revision/current` 追加
+  `active_restriction_window_ids` / `active_restriction_windows` 与
+  `restriction_window_events`；`/api/revision/compare` 追加窗口集合增删
+  （`active_restriction_window_ids`）与区间内的 `restriction_window_activated` /
+  `restriction_window_released` 事件（也并入统一的 `differences` / `events`）。
+  **原批准事件不追改**。
+
 ### 可用调频位置查询（不改状态）
 
 `POST /api/applications/{id}/available-ranges` 为**待审批**申请寻找可用调频位置：
@@ -239,7 +321,9 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 有效许可与当前生效保护带宽：只有空间与时间均相交的许可才会阻断；对这样的许可
 `[L0, L1]`，下界 `x` 的禁区恰为 `(L0 - w - g, L1 + g)`——端点相碰算干扰、分离间隔
 **严格小于** `g` 算干扰，故 `g > 0` 时禁区为开区间（间隔恰等于 `g` 可取），
-`g = 0` 时为闭区间（相碰的端点本身不可取）。
+`g = 0` 时为闭区间（相碰的端点本身不可取）。此外，每个在空间与时间上相交的
+**生效管制窗口** `[W0, W1]` 增加一个**闭**禁区 `[W0 - w, W1]`（两端都不可取；
+保护带宽不扩张窗口）。
 
 响应返回当前修订号、保护带宽、固定带宽 `bandwidth`，以及候选下界区间内**全部
 极大的可用连续范围**（升序），每段用 `min_inclusive` / `max_inclusive` 标明两端
@@ -252,10 +336,11 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 ### 修订号与并发模型
 
 - 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、暂停、恢复、撤销、
-  **保护带宽变更**或**释放时自动获批的每个候补申请**都使修订号 +1，并追加一条
-  不可变事件（暂停/恢复因修订号过期或恢复互扰被拒绝时**不占**修订号；候补登记与
-  取消也**不占**修订号）。候补自动批准与其触发释放同处一个事务：释放操作占一个
-  修订号，每个自动获批申请占其后连续的一个修订号。
+  **保护带宽变更**、**管制窗口的启用与解除（各一次）**或**释放时自动获批的每个
+  候补申请**都使修订号 +1，并追加一条不可变事件（暂停/恢复因修订号过期或恢复
+  互扰被拒绝时**不占**修订号；候补登记与取消也**不占**修订号；窗口预演同样
+  不占修订号）。候补自动批准与其触发释放同处一个事务：释放操作占一个修订号，
+  每个自动获批申请占其后连续的一个修订号。
 - `POST .../preview` 返回 `current_revision`、冲突对象及每个触发条件。
 - `POST .../approve` 必须携带 `expected_revision`。服务在 PostgreSQL
   单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销/带宽变更事务：
@@ -274,9 +359,9 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   - 全部通过时**按输入顺序**为每项写一条批准事件，占用连续修订号
     `n+1, n+2, …`，整组**一次提交**；按其中任一修订号查询 `/api/revision/{k}`，
     即还原截至该项获批时的有效集合。
-- 并发单笔批准、整组批准、暂停、恢复、撤销或带宽变更在同一锁（SQLite 退化为唯一
-  修订号约束兜底）上裁决，胜者提交、其余返回 `stale_revision`，**不会产生部分获批
-  或互相干扰的有效许可**。
+- 并发单笔批准、整组批准、暂停、恢复、撤销、带宽变更或管制窗口启用/解除在同一锁
+  （SQLite 退化为唯一修订号约束兜底）上裁决，胜者提交、其余返回 `stale_revision`，
+  **不会产生部分获批或互相干扰的有效许可**。
 - `POST .../revoke` 只把申请移出有效集合（产生新修订号），历史不删除；对**暂停中**
   的许可同样可用（永久撤销，响应附 `"was_suspended": true`），撤销后不能恢复。
 - 历史快照额外返回 `suspended_application_ids`、`suspensions`、`resumptions`；
@@ -287,16 +372,18 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   任一修订号查询即可逐项还原自动审批；当前快照另附候补队列
   `waitlist_application_ids` / `waitlist_entries`。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、暂停、恢复、撤销记录、
-  **当时生效的保护带宽**及带宽变更记录（`n` 超过当前修订号返回 404）。
+  **当时生效的保护带宽**、带宽变更记录及**当时生效的管制窗口与窗口启用/解除记录**
+  （`n` 超过当前修订号返回 404）。
 - `GET /api/revision/compare?base_revision={a}&target_revision={b}`
-  对两个已存在修订号做只读复核。返回两侧保护带宽、有效/暂停许可集合及增删集合、
-  区间内按修订号排序的 `approval` / `suspension` / `resumption` / `revocation` /
-  `guard_band_change` 事件（合并字段为 `differences`；各类事件也分别在
-  `approvals`、`suspensions`、`resumptions`、`revocations`、
-  `guard_band_changes` 中返回）、逐次 `status_changes`，其中审批事件保留
+  对两个已存在修订号做只读复核。返回两侧保护带宽、有效/暂停许可集合、生效管制窗口
+  集合及增删集合、区间内按修订号排序的 `approval` / `suspension` / `resumption` /
+  `revocation` / `guard_band_change` / `restriction_window_activated` /
+  `restriction_window_released` 事件（合并字段为 `differences`；各类事件也分别在
+  `approvals`、`suspensions`、`resumptions`、`revocations`、`guard_band_changes`、
+  `restriction_window_events` 中返回）、逐次 `status_changes`，其中审批事件保留
   `auto_approved` 与 `release_revision`。可选 `application_id` 只筛选该申请的
-  许可事件（保护带宽变更仍返回）；未知申请返回 404。该接口只读取事件表，不修改
-  申请、许可、候补队列或修订号。
+  许可事件（保护带宽与管制窗口变更仍返回）；未知申请返回 404。该接口只读取事件表，
+  不修改申请、许可、候补队列、管制窗口或修订号。
 
 ### 保护带宽的在线调整
 
@@ -342,7 +429,12 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `POST` | `/api/applications/{id}/waitlist/cancel` | **取消候补**（不改申请状态、不占修订号） |
 | `GET` | `/api/waitlist` | 查询整条候补队列（FIFO）与当前修订号 |
 | `GET` | `/api/applications/{id}/waitlist` | 查询单个申请的候补位置 |
-| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 全部事件 |
+| `POST` | `/api/restriction-windows/preview` | **管制窗口预演**（只读：命中的当前有效许可与候补申请、当前修订号） |
+| `POST` | `/api/restriction-windows` | **确认启用管制窗口**（圆/频段/时段/原因 + 预期修订号；占一个修订号） |
+| `POST` | `/api/restriction-windows/{id}/release` | **解除管制窗口**（窗口 ID + 预期修订号；只影响后续裁决，不审批候补） |
+| `GET` | `/api/restriction-windows` | 列出生效窗口（`include_inactive`/`status` 可含已解除） |
+| `GET` | `/api/restriction-windows/{id}` | 查询单个窗口（生效中或已解除） |
+| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 生效窗口 + 全部事件 |
 | `GET` | `/api/revision/compare` | 比较两个已存在修订号的带宽、许可集合、状态与按事件顺序的差异（只读） |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
 | `GET` | `/api/config/guard-band` | 当前生效带宽、初始带宽与当前修订号 |
@@ -358,8 +450,9 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
-| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`） |
+| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`）；管制窗口形状非法（同申请各码）或**预演/确认时已过期**（`restriction_window_expired`） |
 | 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID） |
+| 404 | `restriction_window_not_found` | 解除或查询一个从未存在的管制窗口 ID |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
 | 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 / 对非待审批申请查询可用位置（整组时 `details.applications` 列出每项状态） |
 | 409 | `already_revoked` | 重复撤销（整组中混入已撤销申请时同样返回，明细同 `not_pending` 结构）；对已撤销许可暂停或恢复 |
@@ -368,8 +461,10 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | 409 | `not_suspended` | 对未处于暂停状态的申请执行恢复（待审批/已获批均然，`details.status` 给出当前状态） |
 | 409 | `already_waitlisted` | 把同一申请**重复登记**为候补（`details.position` 给出当前位置） |
 | 409 | `not_waitlisted` | 取消一个**不在候补队列中**的申请（`details.status` 给出当前状态）；单项查询未登记申请时同码返回 **404** |
-| 409 | `stale_revision` | 修订号过期或被并发批准/暂停/恢复/撤销/带宽变更抢占（单笔/整组/暂停/恢复/带宽变更共享裁决） |
-| 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件）；或**恢复暂停许可时与当前有效许可互扰**，许可保持暂停（`details.conflicts` 附冲突对象，与单笔批准同构） |
+| 409 | `stale_revision` | 修订号过期或被并发批准/暂停/恢复/撤销/带宽变更/**管制窗口启用或解除**抢占（单笔/整组/暂停/恢复/带宽变更/窗口共享裁决） |
+| 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件）；或**恢复暂停许可时与当前有效许可互扰**，许可保持暂停（`details.conflicts` 附冲突对象，与单笔批准同构）。整组中同时存在普通干扰与窗口命中时也用本码，窗口命中另见各项 `restriction_window_conflicts` |
+| 409 | `restriction_window` | 写操作会让一个**命中生效管制窗口**的申请生效：单笔/整组批准或暂停恢复被阻止（`details.restriction_window_conflicts[]` 附命中窗口与三维触发标志，单笔另附 `conflicts[]` 保持结构兼容）；许可不生效、申请不离开原状态、不占修订号 |
+| 409 | `restriction_window_not_active` | 解除一个**已经解除**的管制窗口（`details.released_at_revision` 给出解除修订号；不占修订号） |
 
 ---
 
@@ -1001,6 +1096,168 @@ curl -s http://localhost:8000/api/revision/4
 （`./examples/walkthrough.sh http://localhost:8000`），其中第 26–31 步为
 暂停 / 恢复走查、第 32–37 步为候补队列完整走查。
 
+### 6.18 临时频谱管制窗口：预演 → 确认 → 阻断写操作 → 解除
+
+设保护带宽 **2 MHz**，许可 A `[100,110]` 已在修订号 **1** 获批；待审申请
+B `[106,107]`、D `[200,210]`，B 已登记候补。运营人员要在 09:00–11:00 对同地
+`[105,108]` 频段做临时管制。
+
+**第 1 步：预演（不改状态、不占修订号）**——列出命中的当前有效许可与候补：
+
+```bash
+curl -s -X POST http://localhost:8000/api/restriction-windows/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "circle":    {"cx": 0, "cy": 0, "radius": 1000},
+    "frequency": {"low": 105, "high": 108},
+    "time_window": {"start": "2026-10-05T09:00:00Z", "end": "2026-10-05T11:00:00Z"},
+    "reason": "重要活动临时管制"
+  }'
+```
+
+```json
+{"window": {"circle": {...}, "frequency": {"low": 105.0, "high": 108.0}, ...},
+ "current_revision": 1, "hit_count": 2,
+ "hit_effective_application_ids": [1],
+ "hit_effective": [{"application_id": 1,
+   "trigger": {"time_intersect": true, "area_intersect": true,
+               "frequency_intersect": true}}],
+ "hit_waitlist_application_ids": [2],
+ "hit_waitlist": [{"application_id": 2, "queue_position": 1,
+   "trigger": {"time_intersect": true, "area_intersect": true,
+               "frequency_intersect": true}}]}
+```
+
+预演后当前修订号仍是 1。频段端点相碰也算命中：把窗口频段改成 `[110,120]`
+预演仍会命中 A（闭区间相碰）；但 `[111,112]` 不命中（间隔 1 MHz 虽小于保护带宽
+2 MHz，**保护带宽不扩张窗口**）；窗口时段从 A 的结束时刻 `12:00` 开始也不命中
+（左闭右开）。
+
+**第 2 步：携预期修订号确认（占修订号 2）**——既有许可 A 继续有效：
+
+```bash
+curl -s -X POST http://localhost:8000/api/restriction-windows \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "circle":    {"cx": 0, "cy": 0, "radius": 1000},
+    "frequency": {"low": 105, "high": 108},
+    "time_window": {"start": "2026-10-05T09:00:00Z", "end": "2026-10-05T11:00:00Z"},
+    "reason": "重要活动临时管制", "expected_revision": 1
+  }'
+# {"activated": true, "window_id": 1, "id": 1, "revision": 2,
+#  "window": {"id": 1, "status": "active", "revision": 2, ...},
+#  "hit_effective_application_ids": [1], ...}
+
+curl -s http://localhost:8000/api/revision/current | \
+  python3 -c 'import json,sys; d=json.load(sys.stdin); print("effective =", d["effective_application_ids"], "windows =", d["active_restriction_window_ids"])'
+# effective = [1] windows = [1]     <- A 未被撤销，继续有效
+```
+
+过期修订号确认返回 409 `stale_revision`，窗口、许可、修订号均不变；预演/确认
+一个 `end` 已过的窗口返回 422，明细码 `restriction_window_expired`。
+
+**第 3 步：窗口生效后，待审预览报告命中，但原字段含义不变**
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/preview
+# {"application_id": 2, "current_revision": 2,
+#  "has_conflicts": false, "conflicts": [],                         <- 许可干扰（A 频段 [100,110] 与 B 相交时这里可能同时为 true）
+#  "has_restriction_window_conflicts": true,
+#  "restriction_window_conflicts": [{"window": {"id": 1, ...},
+#    "trigger": {"time_intersect": true, "area_intersect": true,
+#                "frequency_intersect": true},
+#    "reason": "restriction_window"}],
+#  "active_restriction_window_ids": [1]}
+```
+
+**第 4 步：写操作不得使命中申请生效（409，不占修订号）**
+
+```bash
+curl -i -X POST http://localhost:8000/api/applications/2/approve \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 2}'
+# HTTP/1.1 409 Conflict
+# {"error": {"code": "restriction_window",
+#   "message": "application 2 hits 1 active restriction window(s); ...",
+#   "details": {"current_revision": 2,
+#     "restriction_window_conflicts": [{"window": {"id": 1, ...}, "trigger": {...}}],
+#     "conflicts": []}}}
+# B 仍是 pending；修订号仍是 2。
+```
+
+整组批准中若有成员命中窗口，整组不批准（命中成员在
+`details.applications[].restriction_window_conflicts` 列出；若组内另有普通许可
+干扰则错误码仍是 `interference`）；暂停许可的恢复同样被窗口阻止
+（409 `restriction_window`，许可保持暂停）。
+
+**第 5 步：候补释放重裁时命中窗口者保留队列并继续检查后项**
+
+暂停 A（释放，修订号 3）触发同一事务内的候补重裁：B 已无许可冲突但命中窗口 →
+保留候补；D `[200,210]` 不命中任何窗口 → 自动批准（修订号 4）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/1/suspend \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2, "reason": "为后项让路"}'
+# {"suspended": true, "revision": 3, "final_revision": 4,
+#  "auto_approved_application_ids": [4],
+#  "remaining_waitlist_application_ids": [2],
+#  "waitlist_pending": [{"application_id": 2, "conflicts": [],
+#    "restriction_window_conflicts": [{"window": {"id": 1, ...}}]}]}
+```
+
+**第 6 步：可用调频范围排除会命中窗口的位置**
+
+B 频段宽度 1 MHz；窗口 `[105,108]` 对下界 `x` 的禁区为**闭**区间 `[104,108]`
+（两端都不可取，且不被保护带宽加宽）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/available-ranges \
+  -H 'Content-Type: application/json' -d '{"candidate_low_min": 100, "candidate_low_max": 115}'
+# {"available_ranges": [
+#   {"min": 100.0, "max": 104.0, "min_inclusive": true,  "max_inclusive": false},
+#   {"min": 108.0, "max": 115.0, "min_inclusive": false, "max_inclusive": true}], ...}
+```
+
+**第 7 步：凭窗口 ID 与预期修订号解除（占修订号 5；不主动审批候补）**
+
+```bash
+curl -s -X POST http://localhost:8000/api/restriction-windows/1/release \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 4, "reason": "管制结束"}'
+# {"released": true, "window_id": 1, "revision": 5,
+#  "activated_at_revision": 2, "reason": "管制结束", "window": {...}}
+
+curl -s http://localhost:8000/api/waitlist |
+  python3 -c 'import json,sys; print("queue =", json.load(sys.stdin)["waitlist_application_ids"])'
+# queue = [2]      <- 解除不触发自动审批，B 仍在候补
+```
+
+重复解除 → 409 `restriction_window_not_active`；未知 ID → 404
+`restriction_window_not_found`；过期修订号 → 409 `stale_revision`（均不占修订号）。
+解除后 B 的裁决不再受阻：之后手动批准，或等待下一次暂停/撤销释放自动批准。
+
+**第 8 步：历史查询与对比还原当时的窗口与变动，原批准事件不追改**
+
+```bash
+curl -s http://localhost:8000/api/revision/2
+# {"revision": 2, "active_restriction_window_ids": [1],
+#  "active_restriction_windows": [{"id": 1, "status": "active", "revision": 2, ...}],
+#  "restriction_window_events": [{"revision": 2, "event_type": "activated",
+#                                "window_id": 1, "window": {...}}],
+#  "approvals": [{"revision": 1, "status_as_of": "approved", ...}]}
+
+curl -s "http://localhost:8000/api/revision/compare?base_revision=1&target_revision=5"
+# {"active_restriction_window_ids": {"base": [], "target": [], "added": [], "removed": [1]},
+#  "restriction_window_events": [
+#    {"type": "restriction_window_activated", "revision": 2, ...},
+#    {"type": "restriction_window_released",  "revision": 5, ...}], ...}
+
+curl -s "http://localhost:8000/api/restriction-windows?include_inactive=true"
+# {"active_windows": [],
+#  "released_windows": [{"id": 1, "status": "released",
+#    "activated_at_revision": 2, "released_at_revision": 5, ...}]}
+```
+
 ---
 
 ## 7. 项目结构
@@ -1008,15 +1265,15 @@ curl -s http://localhost:8000/api/revision/4
 ```
 .
 ├── app/
-│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询与候补队列/释放自动重裁）
-│   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两、有效集成对检查与可用下界区间求解）
-│   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽与候选下界区间校验）
-│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest）
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽事件 + 候补队列 + 修订号/当前带宽）
+│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询、候补队列/释放自动重裁与临时管制窗口预演/启用/解除）
+│   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决、管制窗口命中判定（含组内两两、有效集成对检查、含窗口闭禁区的可用下界区间求解）
+│   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽、候选下界区间与管制窗口形状/过期校验）
+│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest、RestrictionWindow*Request）
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽/管制窗口事件 + 生效管制窗口 + 候补队列 + 修订号/当前带宽）
 │   ├── db.py                   # 引擎、等待数据库、建表与旧库列升级、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封
-├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例）
+├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例、test_restriction_windows*.py 管制窗口用例）
 ├── examples/walkthrough.sh     # curl 走查脚本
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动

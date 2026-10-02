@@ -18,6 +18,12 @@ POST   /api/applications/{id}/waitlist/cancel
                                          withdraw a standby (no revision used)
 GET    /api/waitlist                     the FIFO standby queue
 GET    /api/applications/{id}/waitlist   one standby position
+POST   /api/restriction-windows/preview  rehearse a control window (dry-run)
+POST   /api/restriction-windows          confirm a window (expected revision)
+POST   /api/restriction-windows/{id}/release
+                                         lift a window (expected revision)
+GET    /api/restriction-windows          list active (+ released) windows
+GET    /api/restriction-windows/{id}     one window (active or released)
 GET    /api/revision/current             current revision + effective set
 GET    /api/revision/{revision}          as-of snapshot (all event types)
 GET    /api/revision/compare             compare two as-of revision snapshots
@@ -75,6 +81,26 @@ a manually decided application is never auto-approved.  Every automatic
 approval is an ordinary ``ApprovalEvent`` flagged ``auto_approved`` with the
 release revision, which lets revision snapshots restore the automatic
 decisions one revision at a time.
+
+Restriction windows
+-------------------
+Operators temporarily control part of the spectrum with restriction
+windows: a coverage circle, a closed frequency band and a half-open UTC
+interval, plus a reason.  A read-only rehearsal preview lists the currently
+effective licenses and standby applications the proposal would hit (and the
+revision it is based on) without changing state; the confirmation carries
+the expected revision, consumes one revision and activates the window.
+Existing effective licenses that the window hits stay effective, but from
+that revision onwards pending previews, single/batch approvals, suspended
+license resumptions and post-release waitlist auto-approvals all report hit
+windows, and no write may make a hit application effective.  A hit needs the
+circle, half-open time and closed frequency band all to intersect (touching
+band endpoints hit); the guard band never extends a window.  Releasing a
+window by its id and the expected revision consumes another revision but
+only affects later adjudication (it never auto-approves the waitlist).
+Activations and releases are immutable events, so revision snapshots and
+comparisons restore the windows active at the time; original approval
+events are never rewritten.
 """
 from __future__ import annotations
 
@@ -89,7 +115,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
 from . import adjudication
-from .adjudication import Circle, Conflict, License, PairConflict
+from .adjudication import Circle, Conflict, License, PairConflict, RestrictionWindow, WindowHit
 from .config import settings
 from .db import SessionLocal, engine, init_db, wait_for_database
 from .errors import APIError, api_error_handler
@@ -98,6 +124,8 @@ from .models import (
     ApprovalEvent,
     GuardBandEvent,
     ResumptionEvent,
+    RestrictionWindow as RestrictionWindowRow,
+    RestrictionWindowEvent,
     RevisionMeta,
     RevocationEvent,
     SuspensionEvent,
@@ -111,6 +139,9 @@ from .schemas import (
     GuardBandPreviewRequest,
     GuardBandUpdateRequest,
     ResumptionRequest,
+    RestrictionWindowConfirmRequest,
+    RestrictionWindowReleaseRequest,
+    RestrictionWindowRequest,
     RevocationRequest,
     SuspensionRequest,
     WaitlistRegistrationRequest,
@@ -119,6 +150,7 @@ from .semantic_validation import (
     validate_application,
     validate_candidate_low_range,
     validate_guard_band,
+    validate_restriction_window,
 )
 
 log = logging.getLogger("radio.api")
@@ -137,6 +169,11 @@ E_INTERFERENCE = "interference"
 E_DUPLICATE_APPLICATION = "duplicate_application_id"
 E_ALREADY_WAITLISTED = "already_waitlisted"
 E_NOT_WAITLISTED = "not_waitlisted"
+# A write was blocked because the target hits an active restriction window
+# (HTTP 409; same envelope shape as ``interference``).
+E_RESTRICTION_WINDOW = "restriction_window"
+E_WINDOW_NOT_FOUND = "restriction_window_not_found"
+E_WINDOW_NOT_ACTIVE = "restriction_window_not_active"
 
 
 # --------------------------------------------------------------------------- #
@@ -263,6 +300,102 @@ def load_effective_licenses(session) -> list[License]:
 
 
 # --------------------------------------------------------------------------- #
+# Temporary restriction windows
+# --------------------------------------------------------------------------- #
+def serialize_window(
+    window: RestrictionWindow | RestrictionWindowRow,
+    *,
+    status: str = "active",
+    activated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Public shape of a restriction window (row or adjudicator dataclass)."""
+    is_row = isinstance(window, RestrictionWindowRow)
+    window_id = window.id if is_row else window.window_id
+    cx = window.cx if is_row else window.circle.cx
+    cy = window.cy if is_row else window.circle.cy
+    radius = window.radius if is_row else window.circle.radius
+    body = {
+        "id": window_id,
+        "window_id": window_id,
+        "status": status,
+        "circle": {"cx": cx, "cy": cy, "radius": radius},
+        "frequency": {"low": window.freq_low, "high": window.freq_high},
+        "time_window": {
+            "start": iso(window.start_time),
+            "end": iso(window.end_time),
+        },
+        "reason": window.reason,
+        "revision": window.revision,
+    }
+    if activated_at is not None:
+        body["activated_at"] = iso(activated_at)
+    return body
+
+
+def serialize_window_row(row: RestrictionWindowRow) -> dict[str, Any]:
+    return serialize_window(row, activated_at=row.created_at)
+
+
+def serialize_window_hit(hit: WindowHit) -> dict[str, Any]:
+    """One hit window with its trigger conditions (mirrors a conflict)."""
+    return {
+        "window": serialize_window(hit.window),
+        "trigger": {
+            "time_intersect": hit.time_intersect,
+            "area_intersect": hit.area_intersect,
+            "frequency_intersect": hit.frequency_intersect,
+        },
+        "reason": hit.reason,
+    }
+
+
+def to_window(row: RestrictionWindowRow) -> RestrictionWindow:
+    return RestrictionWindow(
+        window_id=row.id,
+        circle=Circle(row.cx, row.cy, row.radius),
+        freq_low=row.freq_low,
+        freq_high=row.freq_high,
+        start_time=_utc(row.start_time),
+        end_time=_utc(row.end_time),
+        reason=row.reason,
+        revision=row.revision,
+    )
+
+
+def load_active_windows(session) -> list[RestrictionWindowRow]:
+    """Windows confirmed and not yet released, in confirmation order."""
+    return (
+        session.query(RestrictionWindowRow)
+        .order_by(RestrictionWindowRow.id)
+        .all()
+    )
+
+
+def window_hits_for(
+    candidate: License, window_rows: list[RestrictionWindowRow]
+) -> list[WindowHit]:
+    """Hit windows for one candidate against the active window rows."""
+    return adjudication.evaluate_restriction_windows(
+        candidate, [to_window(row) for row in window_rows]
+    )
+
+
+def proposed_window(payload: RestrictionWindowRequest) -> RestrictionWindow:
+    """Build an unsaved adjudicator window from a preview/confirm payload."""
+    return RestrictionWindow(
+        window_id=0,
+        circle=Circle(
+            payload.circle.cx, payload.circle.cy, payload.circle.radius
+        ),
+        freq_low=payload.frequency.low,
+        freq_high=payload.frequency.high,
+        start_time=payload.time_window.start.astimezone(timezone.utc),
+        end_time=payload.time_window.end.astimezone(timezone.utc),
+        reason=payload.reason,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Waitlist (standby queue for pending applications while the band is busy)
 # --------------------------------------------------------------------------- #
 def serialize_waitlist_entry(
@@ -292,6 +425,7 @@ def drain_waitlist(
     session,
     meta: RevisionMeta,
     release_revision: int,
+    window_rows: list[RestrictionWindowRow] | None = None,
 ) -> dict[str, Any]:
     """Re-adjudicate the standby queue after an effective license was released.
 
@@ -300,11 +434,18 @@ def drain_waitlist(
     visited strictly in registration order and re-adjudicated against the
     current guard band and the licenses effective *so far*:
 
-    * an entry with no conflicts is approved immediately, consumes the next
-      consecutive revision, leaves the queue and joins the effective set, so
-      later entries are also checked against it;
-    * an entry that still interferes keeps its place in the queue and the
-      drain continues with the following entries.
+    * an entry with no conflicts and no restriction-window hits is approved
+      immediately, consumes the next consecutive revision, leaves the queue
+      and joins the effective set, so later entries are also checked against
+      it;
+    * an entry that still interferes with a license or hits an active
+      restriction window keeps its place in the queue and the drain
+      continues with the following entries.
+
+    Restriction windows are enforced with the live set of active window rows
+    (the guard band never extends a window).  Releasing a window itself never
+    calls this function, so lifting a control only affects later
+    adjudications and never auto-approves standbys.
 
     Manually approved applications have had their queue entries removed by
     the approve/batch handlers, so a queued application is never
@@ -315,6 +456,10 @@ def drain_waitlist(
     """
     guard_band = meta.guard_band
     effective = load_effective_licenses(session)
+    window_rows = (
+        window_rows if window_rows is not None else load_active_windows(session)
+    )
+    window_views = [to_window(row) for row in window_rows]
 
     approved: list[dict[str, Any]] = []
     pending_details: list[dict[str, Any]] = []
@@ -327,16 +472,22 @@ def drain_waitlist(
             continue
         candidate = to_license(row)
         conflicts = adjudication.evaluate(candidate, effective, guard_band)
-        if conflicts:
-            # Still blocked: keep the queue entry and carry on with the rest.
-            pending_details.append(
-                {
-                    "application_id": row.id,
-                    "conflicts": [
-                        serialize_conflict(c, guard_band) for c in conflicts
-                    ],
-                }
-            )
+        hits = adjudication.evaluate_restriction_windows(
+            candidate, window_views
+        )
+        if conflicts or hits:
+            # Still blocked (by a license or by a restriction window): keep
+            # the queue entry and carry on with the rest.
+            detail = {
+                "application_id": row.id,
+                "conflicts": [
+                    serialize_conflict(c, guard_band) for c in conflicts
+                ],
+                "restriction_window_conflicts": [
+                    serialize_window_hit(h) for h in hits
+                ],
+            }
+            pending_details.append(detail)
             continue
 
         # Passes now: approve immediately, one more revision, same band.
@@ -436,6 +587,12 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         .order_by(GuardBandEvent.revision)
         .all()
     )
+    window_events = (
+        session.query(RestrictionWindowEvent)
+        .filter(RestrictionWindowEvent.revision <= revision)
+        .order_by(RestrictionWindowEvent.revision)
+        .all()
+    )
 
     # Replay every lifecycle event up to the target revision in revision
     # order; the last event of each application decides its as-of state.
@@ -524,6 +681,48 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         for ev in resumptions
     ]
 
+    # Replay restriction-window lifecycle rows: an activation inserts the
+    # window (keyed by its stable window id), a release removes it.  The
+    # result is exactly the set of windows active *at* the target revision;
+    # expired-but-not-released windows remain active as adjudication rules
+    # (a window is only lifted by an explicit release).
+    active_windows: dict[int, RestrictionWindow] = {}
+    window_activated_revision: dict[int, int] = {}
+    window_records: list[dict[str, Any]] = []
+    for ev in window_events:
+        record = {
+            "revision": ev.revision,
+            "event_type": ev.event_type,
+            "window_id": ev.window_id,
+            "reason": ev.reason,
+            "created_at": iso(ev.created_at),
+        }
+        if ev.event_type == "activated":
+            window = RestrictionWindow(
+                window_id=ev.window_id,
+                circle=Circle(ev.cx, ev.cy, ev.radius),
+                freq_low=ev.freq_low,
+                freq_high=ev.freq_high,
+                start_time=_utc(ev.start_time),
+                end_time=_utc(ev.end_time),
+                reason=ev.reason,
+                revision=ev.revision,
+            )
+            active_windows[ev.window_id] = window
+            window_activated_revision[ev.window_id] = ev.revision
+            record["window"] = serialize_window(window)
+        elif ev.event_type == "released":
+            active_windows.pop(ev.window_id, None)
+        window_records.append(record)
+
+    active_window_records = [
+        serialize_window(
+            active_windows[wid],
+            activated_at=None,
+        )
+        for wid in sorted(active_windows)
+    ]
+
     return {
         "revision": revision,
         "guard_band": guard_band_at(session, revision),
@@ -538,6 +737,9 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         ],
         "effective_application_ids": effective_ids,
         "suspended_application_ids": suspended_ids,
+        "active_restriction_window_ids": sorted(active_windows),
+        "active_restriction_windows": active_window_records,
+        "restriction_window_events": window_records,
         "approvals": approval_records,
         "suspensions": suspension_records,
         "resumptions": resumption_records,
@@ -588,6 +790,8 @@ def build_revision_comparison(
     target_effective = set(target_snapshot["effective_application_ids"])
     base_suspended = set(base_snapshot["suspended_application_ids"])
     target_suspended = set(target_snapshot["suspended_application_ids"])
+    base_windows = set(base_snapshot["active_restriction_window_ids"])
+    target_windows = set(target_snapshot["active_restriction_window_ids"])
 
     def in_scope(app_id: int) -> bool:
         return application_id is None or app_id == application_id
@@ -647,6 +851,20 @@ def build_revision_comparison(
         guard_band_changes.append(record)
         events.append(record)
 
+    restriction_window_events: list[dict[str, Any]] = []
+    for event in newer["restriction_window_events"]:
+        if event["revision"] <= older_revision:
+            continue
+        record = dict(event)
+        # Normalised event type across the unified difference stream.
+        record["type"] = (
+            "restriction_window_activated"
+            if event["event_type"] == "activated"
+            else "restriction_window_released"
+        )
+        restriction_window_events.append(record)
+        events.append(record)
+
     events.sort(key=lambda event: event["revision"])
 
     interval_statuses = _snapshot_status_map(older)
@@ -682,6 +900,8 @@ def build_revision_comparison(
     base_effective_removed = sorted(base_effective - target_effective)
     base_suspended_added = sorted(target_suspended - base_suspended)
     base_suspended_removed = sorted(base_suspended - target_suspended)
+    base_windows_added = sorted(target_windows - base_windows)
+    base_windows_removed = sorted(base_windows - target_windows)
 
     def revision_view(
         snapshot: dict[str, Any], statuses: dict[int, str]
@@ -692,6 +912,9 @@ def build_revision_comparison(
             "effective_application_ids": snapshot["effective_application_ids"],
             "suspended_application_ids": snapshot[
                 "suspended_application_ids"
+            ],
+            "active_restriction_window_ids": snapshot[
+                "active_restriction_window_ids"
             ],
         }
         if application_id is not None:
@@ -742,12 +965,21 @@ def build_revision_comparison(
             "added_to_target": base_suspended_added,
             "removed_from_base": base_suspended_removed,
         },
+        "active_restriction_window_ids": {
+            "base": sorted(base_windows),
+            "target": sorted(target_windows),
+            "added": base_windows_added,
+            "removed": base_windows_removed,
+            "added_to_target": base_windows_added,
+            "removed_from_base": base_windows_removed,
+        },
         "status_changes": status_changes,
         "approvals": approvals,
         "suspensions": suspensions,
         "resumptions": resumptions,
         "revocations": revocations,
         "guard_band_changes": guard_band_changes,
+        "restriction_window_events": restriction_window_events,
         "differences": events,
         "events": events,
     }
@@ -841,6 +1073,7 @@ def current_revision() -> dict[str, Any]:
             serialize_waitlist_entry(session, entry, position)
             for position, entry in enumerate(load_waitlist(session), start=1)
         ]
+        active_window_rows = load_active_windows(session)
     return {
         "current_revision": revision,
         "guard_band": guard_band,
@@ -848,6 +1081,11 @@ def current_revision() -> dict[str, Any]:
         "effective_applications": effective_applications,
         "suspended_application_ids": snapshot["suspended_application_ids"],
         "suspended_applications": suspended_applications,
+        "active_restriction_window_ids": [row.id for row in active_window_rows],
+        "active_restriction_windows": [
+            serialize_window_row(row) for row in active_window_rows
+        ],
+        "restriction_window_events": snapshot["restriction_window_events"],
         "waitlist_application_ids": [e["application_id"] for e in waitlist_entries],
         "waitlist_entries": waitlist_entries,
         "approvals": snapshot["approvals"],
@@ -1030,6 +1268,8 @@ def preview_application(application_id: int) -> dict[str, Any]:
         guard_band = meta.guard_band
         effective = load_effective_licenses(session)
         conflicts = adjudication.evaluate(to_license(row), effective, guard_band)
+        window_rows = load_active_windows(session)
+        window_hits = window_hits_for(to_license(row), window_rows)
 
     return {
         "application_id": application_id,
@@ -1037,6 +1277,14 @@ def preview_application(application_id: int) -> dict[str, Any]:
         "guard_band": guard_band,
         "has_conflicts": bool(conflicts),
         "conflicts": [serialize_conflict(c, guard_band) for c in conflicts],
+        # Active temporary restriction windows hit by the application.
+        # Additive field: ``has_conflicts``/``conflicts`` keep their
+        # license-interference meaning; a hit blocks writes regardless.
+        "has_restriction_window_conflicts": bool(window_hits),
+        "restriction_window_conflicts": [
+            serialize_window_hit(h) for h in window_hits
+        ],
+        "active_restriction_window_ids": [row.id for row in window_rows],
     }
 
 
@@ -1094,12 +1342,14 @@ def find_available_ranges(
         guard_band = meta.guard_band
         bandwidth = row.freq_high - row.freq_low
         effective = load_effective_licenses(session)
+        window_rows = load_active_windows(session)
         ranges = adjudication.available_ranges(
             to_license(row),
             effective,
             guard_band,
             payload.candidate_low_min,
             payload.candidate_low_max,
+            windows=[to_window(w) for w in window_rows],
         )
 
     return {
@@ -1109,6 +1359,7 @@ def find_available_ranges(
         "bandwidth": bandwidth,
         "candidate_low_min": payload.candidate_low_min,
         "candidate_low_max": payload.candidate_low_max,
+        "active_restriction_window_ids": [row.id for row in window_rows],
         "available_ranges": [
             {
                 "min": r.min,
@@ -1179,6 +1430,29 @@ def approve_application(
                 conflicts = adjudication.evaluate(
                     to_license(row), effective, guard_band
                 )
+                window_rows = load_active_windows(session)
+                window_hits = window_hits_for(to_license(row), window_rows)
+                if window_hits:
+                    # A hit window forbids the grant even when no license
+                    # interferes; the application stays pending and no
+                    # revision is consumed.
+                    raise APIError(
+                        E_RESTRICTION_WINDOW,
+                        f"application {application_id} hits "
+                        f"{len(window_hits)} active restriction window(s); "
+                        "the license was not granted",
+                        status_code=409,
+                        details={
+                            "current_revision": current,
+                            "restriction_window_conflicts": [
+                                serialize_window_hit(h) for h in window_hits
+                            ],
+                            "conflicts": [
+                                serialize_conflict(c, guard_band)
+                                for c in conflicts
+                            ],
+                        },
+                    )
                 if conflicts:
                     raise APIError(
                         E_INTERFERENCE,
@@ -1375,15 +1649,18 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                         },
                     )
 
-                # Failure type 4: interference, re-adjudicated under the lock.
-                # Every member is checked both against the current effective
-                # set and against every other member of the group.
+                # Failure type 4: interference or restriction-window hits,
+                # re-adjudicated under the lock.  Every member is checked
+                # against the current effective set, every other member of
+                # the group, and every active restriction window.
                 ordered_rows = [rows_by_id[i] for i in payload.application_ids]
                 candidates = [to_license(row) for row in ordered_rows]
                 effective = load_effective_licenses(session)
                 against_effective, within_group = adjudication.evaluate_group(
                     candidates, effective, guard_band
                 )
+                window_rows = load_active_windows(session)
+                window_hit_ids: set[int] = set()
                 interference_details = []
                 for candidate in candidates:
                     eff_conflicts = [
@@ -1394,20 +1671,39 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                         serialize_group_conflict(c, "group", guard_band)
                         for c in within_group[candidate.application_id]
                     ]
-                    if eff_conflicts or group_conflicts:
+                    hits = window_hits_for(candidate, window_rows)
+                    if hits:
+                        window_hit_ids.add(candidate.application_id)
+                    if eff_conflicts or group_conflicts or hits:
                         interference_details.append(
                             {
                                 "application_id": candidate.application_id,
                                 "conflicts": eff_conflicts + group_conflicts,
+                                "restriction_window_conflicts": [
+                                    serialize_window_hit(h) for h in hits
+                                ],
                             }
                         )
                 if interference_details:
-                    raise APIError(
-                        E_INTERFERENCE,
+                    # Window-only blockers get the dedicated code; a batch
+                    # with any ordinary interference keeps ``interference``.
+                    code = (
+                        E_RESTRICTION_WINDOW
+                        if window_hit_ids
+                        and not any(
+                            item["conflicts"] for item in interference_details
+                        )
+                        else E_INTERFERENCE
+                    )
+                    message = (
                         f"{len(interference_details)} application(s) in the "
-                        "batch interfere with effective grants or with each "
-                        "other; the whole batch was rejected and no "
-                        "frequency was granted",
+                        "batch interfere with effective grants, with each "
+                        "other, or hit active restriction windows; the whole "
+                        "batch was rejected and no frequency was granted"
+                    )
+                    raise APIError(
+                        code,
+                        message,
                         status_code=409,
                         details={
                             "expected_revision": payload.expected_revision,
@@ -1739,6 +2035,26 @@ def resume_application(
                 conflicts = adjudication.evaluate(
                     to_license(row), effective, guard_band
                 )
+                window_rows = load_active_windows(session)
+                window_hits = window_hits_for(to_license(row), window_rows)
+                if window_hits:
+                    raise APIError(
+                        E_RESTRICTION_WINDOW,
+                        f"application {application_id} hits "
+                        f"{len(window_hits)} active restriction window(s); "
+                        "the license stays suspended and no revision was consumed",
+                        status_code=409,
+                        details={
+                            "current_revision": current,
+                            "restriction_window_conflicts": [
+                                serialize_window_hit(h) for h in window_hits
+                            ],
+                            "conflicts": [
+                                serialize_conflict(c, guard_band)
+                                for c in conflicts
+                            ],
+                        },
+                    )
                 if conflicts:
                     raise APIError(
                         E_INTERFERENCE,
@@ -1979,6 +2295,441 @@ def get_waitlist_entry(application_id: int) -> dict[str, Any]:
             status_code=404,
             details={"status": row.status},
         )
+
+
+# --------------------------------------------------------------------------- #
+# Temporary restriction windows (preview/activate/release, revision-arbitrated)
+# --------------------------------------------------------------------------- #
+def _window_preview_body(
+    session, payload: RestrictionWindowRequest
+) -> dict[str, Any]:
+    """Shared read-only rehearsal computation for a proposed window.
+
+    Lists the currently effective licenses and standby (waitlisted)
+    applications the proposed window hits, together with the revision each
+    listing is based on.  Never mutates state.  A hit requires the coverage
+    circle, half-open UTC interval and closed frequency band all to
+    intersect (touching band endpoints hit); the guard band never extends a
+    window.
+    """
+    meta = session.get(RevisionMeta, 1)
+    current = meta.revision
+    window = proposed_window(payload)
+
+    effective_hits: list[dict[str, Any]] = []
+    for lic in load_effective_licenses(session):
+        hit = adjudication.restriction_window_hit(lic, window)
+        if hit is not None:
+            effective_hits.append(
+                {
+                    "application_id": lic.application_id,
+                    "application": _license_view(lic),
+                    "trigger": {
+                        "time_intersect": hit.time_intersect,
+                        "area_intersect": hit.area_intersect,
+                        "frequency_intersect": hit.frequency_intersect,
+                    },
+                }
+            )
+
+    waitlist_hits: list[dict[str, Any]] = []
+    for position, entry in enumerate(load_waitlist(session), start=1):
+        row = session.get(Application, entry.application_id)
+        if row is None or row.status != "pending":
+            continue
+        lic = to_license(row)
+        hit = adjudication.restriction_window_hit(lic, window)
+        if hit is not None:
+            waitlist_hits.append(
+                {
+                    "application_id": row.id,
+                    "queue_position": position,
+                    "application": serialize_application(row),
+                    "trigger": {
+                        "time_intersect": hit.time_intersect,
+                        "area_intersect": hit.area_intersect,
+                        "frequency_intersect": hit.frequency_intersect,
+                    },
+                }
+            )
+
+    return {
+        "window": {
+            "circle": {
+                "cx": payload.circle.cx,
+                "cy": payload.circle.cy,
+                "radius": payload.circle.radius,
+            },
+            "frequency": {
+                "low": payload.frequency.low,
+                "high": payload.frequency.high,
+            },
+            "time_window": {
+                "start": iso(window.start_time),
+                "end": iso(window.end_time),
+            },
+            "reason": payload.reason,
+        },
+        "current_revision": current,
+        "hit_effective_application_ids": [h["application_id"] for h in effective_hits],
+        "hit_effective": effective_hits,
+        "hit_waitlist_application_ids": [h["application_id"] for h in waitlist_hits],
+        "hit_waitlist": waitlist_hits,
+        "hit_count": len(effective_hits) + len(waitlist_hits),
+    }
+
+
+def _validate_window_payload(payload: RestrictionWindowRequest) -> None:
+    errors = validate_restriction_window(payload)
+    if errors:
+        raise APIError(
+            E_VALIDATION,
+            "the restriction window was rejected due to invalid fields",
+            status_code=422,
+            details=errors,
+        )
+
+
+@app.post("/api/restriction-windows/preview", tags=["restriction-windows"])
+def preview_restriction_window(payload: RestrictionWindowRequest) -> dict[str, Any]:
+    """Rehearse a temporary restriction window without changing any state.
+
+    Returns the current revision (carry it into the confirmation as
+    ``expected_revision``) and every currently effective license and
+    standby application the proposed window would hit, with the triggering
+    dimensions.  Illegal shapes (mirroring application validation) and
+    already-expired windows are rejected as 422 and consume no revision.
+    """
+    _validate_window_payload(payload)
+    with SessionLocal() as session:
+        return _window_preview_body(session, payload)
+
+
+@app.post("/api/restriction-windows", status_code=201, tags=["restriction-windows"])
+def activate_restriction_window(
+    payload: RestrictionWindowConfirmRequest,
+) -> dict[str, Any]:
+    """Confirm (activate) a rehearsed restriction window.
+
+    Shares the singleton revision lock with every other writer and consumes
+    exactly one revision.  A stale expected revision is refused as
+    ``stale_revision`` and nothing changes.  Existing effective licenses
+    that the window hits stay effective; from this revision onwards pending
+    previews, single/batch approvals, suspended-license resumptions and
+    post-release waitlist auto-approvals report hit windows and no write may
+    make a hit application effective.  The response repeats the rehearsal
+    hits based on the locked state.
+    """
+    _validate_window_payload(payload)
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-preview and "
+                        "re-decide; the restriction window was not activated",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                preview_body = _window_preview_body(session, payload)
+
+                start = payload.time_window.start.astimezone(timezone.utc)
+                end = payload.time_window.end.astimezone(timezone.utc)
+                row = RestrictionWindowRow(
+                    revision=current + 1,
+                    reason=payload.reason,
+                    cx=payload.circle.cx,
+                    cy=payload.circle.cy,
+                    radius=payload.circle.radius,
+                    freq_low=payload.frequency.low,
+                    freq_high=payload.frequency.high,
+                    start_time=start,
+                    end_time=end,
+                )
+                session.add(row)
+                session.flush()  # assign the stable window id
+
+                meta.revision = current + 1
+                session.add(
+                    RestrictionWindowEvent(
+                        revision=meta.revision,
+                        window_id=row.id,
+                        event_type="activated",
+                        reason=payload.reason,
+                        cx=row.cx,
+                        cy=row.cy,
+                        radius=row.radius,
+                        freq_low=row.freq_low,
+                        freq_high=row.freq_high,
+                        start_time=start,
+                        end_time=end,
+                    )
+                )
+                session.flush()
+                response = {
+                    **preview_body,
+                    "activated": True,
+                    "window_id": row.id,
+                    "id": row.id,
+                    "revision": meta.revision,
+                    "reason": payload.reason,
+                    # Full activated window (replaces the preview's proposed
+                    # shape) with the assigned id and activation revision.
+                    "window": serialize_window_row(row),
+                }
+        except IntegrityError:
+            # Backends without row locks (SQLite in tests): a concurrent
+            # writer took the revision slot; nothing was changed.
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-preview and re-decide; the restriction window was not activated",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+@app.post(
+    "/api/restriction-windows/{window_id}/release",
+    tags=["restriction-windows"],
+)
+def release_restriction_window(
+    window_id: int, payload: RestrictionWindowReleaseRequest
+) -> dict[str, Any]:
+    """Lift a restriction window by its id (conditional on the revision).
+
+    Shares revision arbitration with every other writer and consumes exactly
+    one revision.  Releasing only affects later adjudication: no waitlist
+    auto-approval is triggered and existing licenses are untouched.  An
+    unknown window id is 404; releasing an already-released window is 409
+    ``restriction_window_not_active``; a stale revision is 409 and nothing
+    changes.
+    """
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+
+                row = session.get(RestrictionWindowRow, window_id)
+                if row is None:
+                    # Distinguish "never existed" from "already released"
+                    # via the immutable event stream.
+                    activated = (
+                        session.query(RestrictionWindowEvent)
+                        .filter(
+                            RestrictionWindowEvent.window_id == window_id,
+                            RestrictionWindowEvent.event_type == "activated",
+                        )
+                        .one_or_none()
+                    )
+                    if activated is None:
+                        raise APIError(
+                            E_WINDOW_NOT_FOUND,
+                            f"restriction window {window_id} does not exist",
+                            status_code=404,
+                        )
+                    released = (
+                        session.query(RestrictionWindowEvent)
+                        .filter(
+                            RestrictionWindowEvent.window_id == window_id,
+                            RestrictionWindowEvent.event_type == "released",
+                        )
+                        .first()
+                    )
+                    raise APIError(
+                        E_WINDOW_NOT_ACTIVE,
+                        f"restriction window {window_id} is no longer active "
+                        f"(released at revision {released.revision})",
+                        status_code=409,
+                        details={
+                            "window_id": window_id,
+                            "released_at_revision": released.revision,
+                            "activated_at_revision": activated.revision,
+                        },
+                    )
+
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-decide; the "
+                        "restriction window was not released",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                activated_revision = row.revision
+                window_view = to_window(row)
+                meta.revision = current + 1
+                session.add(
+                    RestrictionWindowEvent(
+                        revision=meta.revision,
+                        window_id=window_id,
+                        event_type="released",
+                        reason=payload.reason,
+                    )
+                )
+                session.delete(row)
+                session.flush()
+                response = {
+                    "released": True,
+                    "window_id": window_id,
+                    "revision": meta.revision,
+                    "activated_at_revision": activated_revision,
+                    "reason": payload.reason,
+                    # A window release only changes later adjudication; the
+                    # standby queue is intentionally not drained here.
+                    "window": serialize_window(window_view),
+                }
+        except IntegrityError:
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-decide; the restriction window was not released",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+@app.get("/api/restriction-windows", tags=["restriction-windows"])
+def list_restriction_windows(
+    status: str = "active", include_inactive: bool = False
+) -> dict[str, Any]:
+    """List restriction windows.
+
+    By default only currently active windows are returned; pass
+    ``include_inactive=true`` (or ``status=all``) to also reconstruct
+    released windows from the immutable event stream.  ``status=released``
+    returns only the released windows.
+    """
+    if status not in ("active", "released", "all"):
+        raise APIError(
+            E_VALIDATION,
+            "status filter must be one of active, released, all",
+            status_code=422,
+        )
+    want_active = include_inactive or status in ("active", "all")
+    want_released = include_inactive or status in ("released", "all")
+    with SessionLocal() as session:
+        meta = session.get(RevisionMeta, 1)
+        active_rows = load_active_windows(session)
+        active_ids = {row.id for row in active_rows}
+
+        active_bodies = (
+            [serialize_window_row(row) for row in active_rows]
+            if want_active
+            else []
+        )
+        released_bodies: list[dict[str, Any]] = []
+        if want_released:
+            release_events = (
+                session.query(RestrictionWindowEvent)
+                .filter(RestrictionWindowEvent.event_type == "released")
+                .order_by(RestrictionWindowEvent.revision)
+                .all()
+            )
+            for ev in release_events:
+                activation = (
+                    session.query(RestrictionWindowEvent)
+                    .filter(
+                        RestrictionWindowEvent.window_id == ev.window_id,
+                        RestrictionWindowEvent.event_type == "activated",
+                    )
+                    .one()
+                )
+                window = RestrictionWindow(
+                    window_id=ev.window_id,
+                    circle=Circle(
+                        activation.cx, activation.cy, activation.radius
+                    ),
+                    freq_low=activation.freq_low,
+                    freq_high=activation.freq_high,
+                    start_time=_utc(activation.start_time),
+                    end_time=_utc(activation.end_time),
+                    reason=activation.reason,
+                    revision=activation.revision,
+                )
+                body = serialize_window(window, status="released")
+                body["activated_at_revision"] = activation.revision
+                body["released_at_revision"] = ev.revision
+                body["release_reason"] = ev.reason
+                released_bodies.append(body)
+
+        return {
+            "current_revision": meta.revision,
+            "active_restriction_window_ids": sorted(active_ids),
+            "active_windows": active_bodies,
+            "released_windows": released_bodies,
+            "windows": active_bodies + released_bodies,
+        }
+
+
+@app.get("/api/restriction-windows/{window_id}", tags=["restriction-windows"])
+def get_restriction_window(window_id: int) -> dict[str, Any]:
+    """Fetch one restriction window (active or previously released)."""
+    with SessionLocal() as session:
+        row = session.get(RestrictionWindowRow, window_id)
+        if row is not None:
+            return {"window": serialize_window_row(row)}
+        activation = (
+            session.query(RestrictionWindowEvent)
+            .filter(
+                RestrictionWindowEvent.window_id == window_id,
+                RestrictionWindowEvent.event_type == "activated",
+            )
+            .one_or_none()
+        )
+        if activation is None:
+            raise APIError(
+                E_WINDOW_NOT_FOUND,
+                f"restriction window {window_id} does not exist",
+                status_code=404,
+            )
+        release = (
+            session.query(RestrictionWindowEvent)
+            .filter(
+                RestrictionWindowEvent.window_id == window_id,
+                RestrictionWindowEvent.event_type == "released",
+            )
+            .one_or_none()
+        )
+        window = RestrictionWindow(
+            window_id=window_id,
+            circle=Circle(activation.cx, activation.cy, activation.radius),
+            freq_low=activation.freq_low,
+            freq_high=activation.freq_high,
+            start_time=_utc(activation.start_time),
+            end_time=_utc(activation.end_time),
+            reason=activation.reason,
+            revision=activation.revision,
+        )
+        body = serialize_window(
+            window, status="released" if release else "active"
+        )
+        body["activated_at_revision"] = activation.revision
+        if release is not None:
+            body["released_at_revision"] = release.revision
+            body["release_reason"] = release.reason
+        return {"window": body}
 
 
 # --------------------------------------------------------------------------- #

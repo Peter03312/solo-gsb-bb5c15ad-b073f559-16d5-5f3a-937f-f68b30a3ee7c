@@ -28,6 +28,10 @@ from datetime import datetime
 # Conflict reason codes (also documented in the README).
 REASON_FREQUENCY_INTERSECTION = "frequency_intersection"
 REASON_WITHIN_GUARD_BAND = "within_guard_band"
+# A hit against an active temporary restriction window (circle + half-open
+# time + closed frequency band all intersect; the guard band never extends a
+# window).
+REASON_RESTRICTION_WINDOW = "restriction_window"
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,86 @@ class PairConflict:
     frequency_intersects: bool
     minimum_frequency_gap: float
     reason: str  # REASON_*
+
+
+@dataclass(frozen=True)
+class RestrictionWindow:
+    """An active temporary spectrum-control window.
+
+    A window hits a license/application when its coverage circle intersects
+    the other circle, its half-open UTC time interval intersects the other
+    half-open interval, and its closed frequency band intersects the other
+    closed band (touching endpoints intersect).  The guard band never
+    extends a window: only an actual closed-band intersection counts.
+    """
+
+    window_id: int
+    circle: Circle
+    freq_low: float
+    freq_high: float
+    start_time: datetime
+    end_time: datetime
+    reason: str = ""
+    revision: int | None = None
+
+
+@dataclass(frozen=True)
+class WindowHit:
+    """One restriction window hit by a candidate license.
+
+    The trigger flags mirror :class:`Conflict` so existing clients can reuse
+    the same rendering; ``frequency_intersects`` is the only frequency
+    condition a window has (``minimum_frequency_gap`` is 0.0 on a hit and the
+    guard band is irrelevant).
+    """
+
+    window: RestrictionWindow
+    time_intersect: bool
+    area_intersect: bool
+    frequency_intersect: bool
+    reason: str = REASON_RESTRICTION_WINDOW
+
+
+def restriction_window_hit(
+    lic: License, window: RestrictionWindow
+) -> WindowHit | None:
+    """Whether one license/application hits one restriction window.
+
+    All three dimensions must intersect: circles (touching counts),
+    half-open time intervals (end == start does not overlap) and closed
+    frequency bands (touching endpoints intersect).  No guard band is
+    applied.
+    """
+    t = half_open_intervals_intersect(
+        lic.start_time, lic.end_time, window.start_time, window.end_time
+    )
+    a = circles_intersect(lic.circle, window.circle)
+    f = closed_intervals_intersect(
+        lic.freq_low, lic.freq_high, window.freq_low, window.freq_high
+    )
+    if not (t and a and f):
+        return None
+    return WindowHit(
+        window=window,
+        time_intersect=True,
+        area_intersect=True,
+        frequency_intersect=True,
+    )
+
+
+def evaluate_restriction_windows(
+    candidate: License, windows: list[RestrictionWindow]
+) -> list[WindowHit]:
+    """Every active restriction window hit by ``candidate``.
+
+    The guard band never extends a window, so only geometric (circle,
+    half-open time, closed frequency) intersections are considered.
+    """
+    return [
+        hit
+        for window in windows
+        if (hit := restriction_window_hit(candidate, window)) is not None
+    ]
 
 
 def circles_intersect(a: Circle, b: Circle) -> bool:
@@ -277,6 +361,7 @@ def available_ranges(
     guard_band: float,
     low_min: float,
     low_max: float,
+    windows: list[RestrictionWindow] | None = None,
 ) -> list[AvailableRange]:
     """Maximal lower-bound ranges in ``[low_min, low_max]`` free of conflicts.
 
@@ -294,21 +379,28 @@ def available_ranges(
     is allowed, so it is open.  Grants disjoint in time or area forbid
     nothing.
 
+    Active restriction windows contribute additional forbidden ranges: a
+    window intersecting the candidate in time *and* area forbids the closed
+    lower-bound interval ``[window_low - width, window_high]`` (both
+    endpoints forbidden, because touching closed bands hit the window).
+    The guard band never extends a window, so its forbidden interval is
+    never widened.
+
     The result is the complement of the merged forbidden intervals inside
     ``[low_min, low_max]``: every maximal continuous available range, in
     ascending order, each endpoint flagged attainable or not; empty when no
     lower bound in the candidate interval is usable.  Consistent with
-    :func:`evaluate`: a lower bound is attainable exactly when the shifted
-    candidate would preview with no conflicts.  Attainable endpoints are
-    nudged by ulps until they pass the very frequency predicate
-    :func:`evaluate` applies, so a preview at a reported endpoint agrees
-    with the range even under floating-point rounding.
+    :func:`evaluate` plus :func:`evaluate_restriction_windows`: a lower
+    bound is attainable exactly when the shifted candidate would preview
+    with no license conflict and hit no window.  Attainable endpoints of
+    open (guard-band) intervals are nudged by ulps until they pass the very
+    frequency predicate :func:`evaluate` applies, so a preview at a reported
+    endpoint agrees with the range even under floating-point rounding.
     """
     width = candidate.freq_high - candidate.freq_low
-    # Endpoints of a forbidden interval are forbidden themselves iff the
-    # guard band is zero (endpoint touch counts as interference).
-    forbidden_closed = guard_band == 0
-    intervals: list[tuple[float, float]] = []
+    # Forbidden intervals as (start, end, closed): a closed interval forbids
+    # its own endpoints; an open one leaves them attainable.
+    intervals: list[tuple[float, float, bool]] = []
     for other in effective:
         if not half_open_intervals_intersect(
             candidate.start_time,
@@ -321,7 +413,8 @@ def available_ranges(
             continue
         start = other.freq_low - width - guard_band
         end = other.freq_high + guard_band
-        if not forbidden_closed:
+        closed = guard_band == 0
+        if not closed:
             # The endpoints are reported as attainable (a gap exactly equal
             # to the guard band is allowed).  Rounding may leave the closed
             # form an ulp inside the forbidden zone, so nudge outward until
@@ -336,20 +429,48 @@ def available_ranges(
                 other.freq_low, other.freq_high, guard_band,
             )[0]:
                 end = math.nextafter(end, math.inf)
-        intervals.append((start, end))
+        intervals.append((start, end, closed))
+
+    for window in windows or []:
+        if not half_open_intervals_intersect(
+            candidate.start_time,
+            candidate.end_time,
+            window.start_time,
+            window.end_time,
+        ):
+            continue
+        if not circles_intersect(candidate.circle, window.circle):
+            continue
+        # Closed bands: x in [window_low - width, window_high] hits (the
+        # touching endpoints themselves intersect and are forbidden).
+        intervals.append(
+            (window.freq_low - width, window.freq_high, True)
+        )
+
     intervals.sort()
 
-    # Merge connected forbidden intervals.  Closed intervals (zero guard
-    # band) connect when they touch at an endpoint; open ones leave a
-    # shared endpoint available and stay separate.
-    merged: list[list[float]] = []
-    for start, end in intervals:
+    # Merge connected forbidden intervals.  Each merged interval remembers
+    # whether its two endpoints are forbidden themselves.  A closed
+    # interval connects to the next when they touch at an endpoint; open
+    # endpoints leave that shared point available and stay separate.
+    merged: list[list] = []
+    for start, end, closed in intervals:
         if merged:
-            last = merged[-1]
-            if start < last[1] or (start == last[1] and forbidden_closed):
-                last[1] = max(last[1], end)
+            last_start, last_end, last_start_closed, last_end_closed = merged[-1]
+            if start < last_end or (
+                start == last_end and last_end_closed and closed
+            ):
+                if end > last_end:
+                    merged[-1] = [
+                        last_start,
+                        end,
+                        last_start_closed,
+                        closed,
+                    ]
+                elif end == last_end:
+                    merged[-1][3] = last_end_closed or closed
                 continue
-        merged.append([start, end])
+        merged.append([start, end, closed, closed])
 
     # Complement of the merged intervals inside [low_min, low_max],
     # tracking endpoint attainability.
@@ -361,14 +482,16 @@ def available_ranges(
 
     cursor = low_min
     cursor_inclusive = True  # the candidate interval is closed at low_min
-    for start, end in merged:
+    for start, end, start_closed, end_closed in merged:
         if end < low_min or start > low_max:
             continue
         if cursor <= start:
-            emit(cursor, start, cursor_inclusive, not forbidden_closed)
+            # The right side is attainable only when the forbidden interval
+            # starts with an open endpoint.
+            emit(cursor, start, cursor_inclusive, not start_closed)
         if end >= cursor:
             cursor = end
-            cursor_inclusive = not forbidden_closed
+            cursor_inclusive = not end_closed
     if cursor <= low_max:
         emit(cursor, low_max, cursor_inclusive, True)
     return ranges

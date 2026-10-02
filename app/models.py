@@ -24,6 +24,12 @@ History is event-sourced:
                            standbys while the band is busy; registration and
                            cancellation consume no revision and the entry is
                            removed on approval (manual or automatic);
+* ``restriction_windows`` - currently active temporary spectrum-control
+                           windows (confirmed but not yet released); each
+                           confirmation/release consumes one revision;
+* ``restriction_window_events`` - append-only activation/release records for
+                           restriction windows, one per revision, so snapshots
+                           reconstruct the windows active at any revision;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -216,6 +222,89 @@ class GuardBandEvent(Base):
     )
 
 
+class RestrictionWindow(Base):
+    """A currently active temporary spectrum-control window.
+
+    Operators preview (a read-only rehearsal) and then confirm a window:
+    coverage circle, closed frequency band, half-open UTC time interval,
+    reason and the expected revision.  Confirmation consumes exactly one
+    revision and inserts the window; releasing it with its window id and the
+    expected revision consumes another.  Releasing only affects later
+    adjudication and never auto-approves waitlist entries.
+
+    Existing effective licenses stay effective when a window appears; from
+    the confirmation revision onwards every pending preview, single/batch
+    approval, suspended-license resumption and post-release waitlist
+    auto-approval reports hit windows and no write may make a hit
+    application effective.  A hit requires the circle, the half-open time
+    interval and the closed frequency band all to intersect (touching band
+    endpoints hit); the guard band never extends a window.
+
+    This table mirrors the mutable current state; the append-only
+    :class:`RestrictionWindowEvent` rows are the source of truth for
+    historical revision snapshots.  ``start_time``/``end_time`` and the
+    geometry are NULL on a release row (which only carries window/revision).
+    """
+
+    __tablename__ = "restriction_windows"
+
+    # Stable window id assigned at confirmation; reused by the release call.
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Revision at which the window was confirmed (activated).
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    cx: Mapped[float] = mapped_column(Float, nullable=False)
+    cy: Mapped[float] = mapped_column(Float, nullable=False)
+    radius: Mapped[float] = mapped_column(Float, nullable=False)
+    freq_low: Mapped[float] = mapped_column(Float, nullable=False)
+    freq_high: Mapped[float] = mapped_column(Float, nullable=False)
+    start_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    end_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class RestrictionWindowEvent(Base):
+    """Append-only lifecycle record of a restriction window, one per revision.
+
+    ``event_type`` is ``"activated"`` (confirmation) or ``"released"``.
+    Activation rows carry the full geometry, band, half-open interval and
+    reason; release rows carry only the window id.  Historical revision
+    snapshots replay these rows to reconstruct the windows active at any
+    revision; original approval events are never rewritten.
+    """
+
+    __tablename__ = "restriction_window_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    # NULL on release rows; the activated window's id otherwise.
+    window_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    cx: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    radius: Mapped[float | None] = mapped_column(Float, nullable=True)
+    freq_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    freq_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    start_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    end_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
 class WaitlistEntry(Base):
     """A pending application registered as a standby (FIFO queue).
 
@@ -228,7 +317,9 @@ class WaitlistEntry(Base):
     an effective license drains the queue in registration order inside the
     same transaction: entries that pass re-adjudication under the live guard
     band are approved automatically, the rest keep their place and the drain
-    continues with the following entries.
+    continues with the following entries.  An entry hit by an active
+    restriction window is blocked just like a license conflict: it keeps its
+    place and the drain continues with the following entries.
     """
 
     __tablename__ = "waitlist_entries"

@@ -18,6 +18,11 @@ POST   /api/applications/{id}/waitlist/cancel
                                          withdraw a standby (no revision used)
 GET    /api/waitlist                     the FIFO standby queue
 GET    /api/applications/{id}/waitlist   one standby position
+POST   /api/blackout-windows/preview     rehearse a control window (non-mutating)
+POST   /api/blackout-windows             enable a control window (expected rev.)
+GET    /api/blackout-windows             list control windows
+GET    /api/blackout-windows/{id}        fetch one control window
+POST   /api/blackout-windows/{id}/lift   release a control window (expected rev.)
 GET    /api/revision/current             current revision + effective set
 GET    /api/revision/{revision}          as-of snapshot (all event types)
 GET    /api/revision/compare             compare two as-of revision snapshots
@@ -75,6 +80,31 @@ a manually decided application is never auto-approved.  Every automatic
 approval is an ordinary ``ApprovalEvent`` flagged ``auto_approved`` with the
 release revision, which lets revision snapshots restore the automatic
 decisions one revision at a time.
+
+Temporary spectrum control windows
+----------------------------------
+Operators may temporarily forbid a region of spectrum with a control
+window defined exactly like an application: a coverage circle, a closed
+frequency band and a half-open UTC time span, plus a reason and an
+expected revision.  A dry-run preview lists the currently effective
+licenses and standby applications the window would hit (and the revision
+it is based on) without changing anything; the confirm call enables the
+window and consumes one revision.  Enabling never invalidates existing
+licenses, but starting with that revision every pending preview,
+single/batch approval, resumption and post-release waitlist
+auto-adjudication reports the active windows a candidate hits, and write
+operations must never make a hit license effective.  A window hits a
+license only when circle, half-open time span and closed frequency band
+all intersect: frequency endpoint touches count and the guard band never
+extends a window.  Blocked standby entries keep their queue position and
+the drain continues; the available-ranges search excludes window-hitting
+positions.  Lifting a window takes the window id and an expected revision,
+shares the same revision arbitration (one revision), affects only later
+decisions and never approves standbys on its own.  Every enable/lift
+appends an immutable event with a geometry snapshot, so historical
+revision queries and comparisons restore the windows in force at the time
+and the window changes in the interval; original approval events are
+never rewritten.
 """
 from __future__ import annotations
 
@@ -89,13 +119,21 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
 from . import adjudication
-from .adjudication import Circle, Conflict, License, PairConflict
+from .adjudication import (
+    BlackoutWindow as BlackoutWindowGeometry,
+    Circle,
+    Conflict,
+    License,
+    PairConflict,
+)
 from .config import settings
 from .db import SessionLocal, engine, init_db, wait_for_database
 from .errors import APIError, api_error_handler
 from .models import (
     Application,
     ApprovalEvent,
+    BlackoutWindowEvent,
+    BlackoutWindowRecord,
     GuardBandEvent,
     ResumptionEvent,
     RevisionMeta,
@@ -108,6 +146,9 @@ from .schemas import (
     ApprovalRequest,
     AvailableRangesRequest,
     BatchApprovalRequest,
+    BlackoutWindowCreateRequest,
+    BlackoutWindowLiftRequest,
+    BlackoutWindowPreviewRequest,
     GuardBandPreviewRequest,
     GuardBandUpdateRequest,
     ResumptionRequest,
@@ -117,6 +158,7 @@ from .schemas import (
 )
 from .semantic_validation import (
     validate_application,
+    validate_blackout_window,
     validate_candidate_low_range,
     validate_guard_band,
 )
@@ -137,6 +179,8 @@ E_INTERFERENCE = "interference"
 E_DUPLICATE_APPLICATION = "duplicate_application_id"
 E_ALREADY_WAITLISTED = "already_waitlisted"
 E_NOT_WAITLISTED = "not_waitlisted"
+E_BLACKOUT_WINDOW_HIT = "blackout_window_hit"
+E_BLACKOUT_WINDOW_NOT_ACTIVE = "blackout_window_not_active"
 
 
 # --------------------------------------------------------------------------- #
@@ -262,6 +306,132 @@ def load_effective_licenses(session) -> list[License]:
     return [to_license(row) for row in rows]
 
 
+def to_window_geometry(win: BlackoutWindowRecord) -> BlackoutWindowGeometry:
+    return BlackoutWindowGeometry(
+        window_id=win.id,
+        circle=Circle(win.cx, win.cy, win.radius),
+        freq_low=win.freq_low,
+        freq_high=win.freq_high,
+        start_time=_utc(win.start_time),
+        end_time=_utc(win.end_time),
+        enabled_revision=win.enabled_revision,
+    )
+
+
+def load_active_windows(session) -> list[BlackoutWindowRecord]:
+    """Currently active control windows in id order.
+
+    A window is active from its enabled revision until (exclusive of) its
+    lift revision; this loads the present-day active set used by previews
+    and write-time re-adjudication.
+    """
+    return (
+        session.query(BlackoutWindowRecord)
+        .filter(BlackoutWindowRecord.status == "active")
+        .order_by(BlackoutWindowRecord.id)
+        .all()
+    )
+
+
+def serialize_blackout_window(win: BlackoutWindowRecord) -> dict[str, Any]:
+    """The public shape of one control window."""
+    return {
+        "id": win.id,
+        "name": win.name,
+        "circle": {"cx": win.cx, "cy": win.cy, "radius": win.radius},
+        "frequency": {"low": win.freq_low, "high": win.freq_high},
+        "time_window": {"start": iso(win.start_time), "end": iso(win.end_time)},
+        "status": win.status,
+        "enabled_revision": win.enabled_revision,
+        "lifted_revision": win.lifted_revision,
+        "reason": win.enabled_reason,
+        "lifted_reason": win.lifted_reason,
+        "created_at": iso(win.created_at),
+    }
+
+
+def _window_view(win: BlackoutWindowGeometry) -> dict[str, Any]:
+    """The conflict-party shape of a window inside a preview/error body."""
+    return {
+        "id": win.window_id,
+        "circle": {
+            "cx": win.circle.cx,
+            "cy": win.circle.cy,
+            "radius": win.circle.radius,
+        },
+        "frequency": {"low": win.freq_low, "high": win.freq_high},
+        "time_window": {
+            "start": iso(win.start_time),
+            "end": iso(win.end_time),
+        },
+        "enabled_revision": win.enabled_revision,
+    }
+
+
+def serialize_window_hit(win: BlackoutWindowGeometry) -> dict[str, Any]:
+    """One control window hit reported on a candidate application.
+
+    The trigger flags mirror a preview conflict so existing clients can
+    reuse their rendering; the guard band never extends a window, hence no
+    frequency-gap field is needed.
+    """
+    return {
+        "window": _window_view(win),
+        "trigger": {
+            "time_intersect": True,
+            "area_intersect": True,
+            "frequency_intersect": True,
+        },
+        "reason": "frequency_intersection",
+    }
+
+
+def window_hits_for(
+    lic: License, windows: list[BlackoutWindowGeometry]
+) -> list[BlackoutWindowGeometry]:
+    """Active windows hit by a license-shaped candidate (window-id order)."""
+    return adjudication.evaluate_windows(lic, windows)
+
+
+def blackout_error(
+    message: str,
+    current: int,
+    hits_by_application: dict[int, list[BlackoutWindowGeometry]],
+    conflicts_by_application: dict[int, list[Conflict]] | None = None,
+    guard_band: float = 0.0,
+) -> APIError:
+    """Build the uniform 409 raised when a write would make a hit license effective.
+
+    ``hits_by_application`` maps application id to the windows it hits; it
+    must be non-empty.  Batch operations report every blocked member; single
+    operations report one key.  Any ordinary effective-set interference is
+    attached under ``conflicts`` so a single response reports every blocker.
+    """
+    conflicts_by_application = conflicts_by_application or {}
+    applications = [
+        {
+            "application_id": app_id,
+            "window_hits": [
+                serialize_window_hit(w) for w in hits_by_application[app_id]
+            ],
+            "conflicts": [
+                serialize_conflict(c, guard_band)
+                for c in conflicts_by_application.get(app_id, [])
+            ],
+        }
+        for app_id in sorted(hits_by_application)
+    ]
+    return APIError(
+        E_BLACKOUT_WINDOW_HIT,
+        message,
+        status_code=409,
+        details={
+            "current_revision": current,
+            "applications": applications,
+        },
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Waitlist (standby queue for pending applications while the band is busy)
 # --------------------------------------------------------------------------- #
@@ -315,6 +485,12 @@ def drain_waitlist(
     """
     guard_band = meta.guard_band
     effective = load_effective_licenses(session)
+    # Active control windows gate auto-approvals exactly like manual ones:
+    # a hit keeps the entry queued (the drain continues with later entries)
+    # and the blocking windows are reported on the pending entry.
+    active_windows = [
+        to_window_geometry(win) for win in load_active_windows(session)
+    ]
 
     approved: list[dict[str, Any]] = []
     pending_details: list[dict[str, Any]] = []
@@ -327,13 +503,17 @@ def drain_waitlist(
             continue
         candidate = to_license(row)
         conflicts = adjudication.evaluate(candidate, effective, guard_band)
-        if conflicts:
+        window_hits = window_hits_for(candidate, active_windows)
+        if conflicts or window_hits:
             # Still blocked: keep the queue entry and carry on with the rest.
             pending_details.append(
                 {
                     "application_id": row.id,
                     "conflicts": [
                         serialize_conflict(c, guard_band) for c in conflicts
+                    ],
+                    "window_hits": [
+                        serialize_window_hit(w) for w in window_hits
                     ],
                 }
             )
@@ -436,6 +616,12 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         .order_by(GuardBandEvent.revision)
         .all()
     )
+    window_events = (
+        session.query(BlackoutWindowEvent)
+        .filter(BlackoutWindowEvent.revision <= revision)
+        .order_by(BlackoutWindowEvent.revision)
+        .all()
+    )
 
     # Replay every lifecycle event up to the target revision in revision
     # order; the last event of each application decides its as-of state.
@@ -524,6 +710,38 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         for ev in resumptions
     ]
 
+    window_records = [_serialize_window_event(ev) for ev in window_events]
+    # Windows enabled at or before the target revision and not yet lifted by
+    # it.  The lift status comes from the event stream alone, so this also
+    # restores windows whose current-day row has since been lifted.
+    active_window_ids: list[int] = []
+    active_windows: list[dict[str, Any]] = []
+    for ev in window_events:
+        if ev.kind == "enabled":
+            active_window_ids.append(ev.window_id)
+        elif ev.kind == "lifted" and ev.window_id in active_window_ids:
+            active_window_ids.remove(ev.window_id)
+    if active_window_ids:
+        rows_by_id = {
+            row.id: row
+            for row in session.query(BlackoutWindowRecord)
+            .filter(BlackoutWindowRecord.id.in_(active_window_ids))
+            .all()
+        }
+        for window_id in active_window_ids:
+            row = rows_by_id.get(window_id)
+            if row is not None:
+                active_windows.append(serialize_blackout_window(row))
+            else:
+                # Defensive: reconstruct from the enable event if the row is
+                # ever missing.
+                enable = next(
+                    e
+                    for e in window_events
+                    if e.window_id == window_id and e.kind == "enabled"
+                )
+                active_windows.append(_window_view_from_event(enable))
+
     return {
         "revision": revision,
         "guard_band": guard_band_at(session, revision),
@@ -542,6 +760,44 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         "suspensions": suspension_records,
         "resumptions": resumption_records,
         "revocations": revocation_records,
+        "active_blackout_window_ids": active_window_ids,
+        "active_blackout_windows": active_windows,
+        "blackout_window_events": window_records,
+    }
+
+
+def _serialize_window_event(ev: BlackoutWindowEvent) -> dict[str, Any]:
+    """One append-only control-window transition with its geometry snapshot."""
+    return {
+        "revision": ev.revision,
+        "window_id": ev.window_id,
+        "type": ev.kind,
+        "kind": ev.kind,
+        "reason": ev.reason,
+        "window": {
+            "id": ev.window_id,
+            "circle": {"cx": ev.cx, "cy": ev.cy, "radius": ev.radius},
+            "frequency": {"low": ev.freq_low, "high": ev.freq_high},
+            "time_window": {"start": iso(ev.start_time), "end": iso(ev.end_time)},
+        },
+        "created_at": iso(ev.created_at),
+    }
+
+
+def _window_view_from_event(ev: BlackoutWindowEvent) -> dict[str, Any]:
+    """Reconstruct a window's public shape from an enable-event snapshot."""
+    return {
+        "id": ev.window_id,
+        "name": None,
+        "circle": {"cx": ev.cx, "cy": ev.cy, "radius": ev.radius},
+        "frequency": {"low": ev.freq_low, "high": ev.freq_high},
+        "time_window": {"start": iso(ev.start_time), "end": iso(ev.end_time)},
+        "status": "active",
+        "enabled_revision": ev.revision,
+        "lifted_revision": None,
+        "reason": ev.reason,
+        "lifted_reason": None,
+        "created_at": iso(ev.created_at),
     }
 
 
@@ -588,6 +844,8 @@ def build_revision_comparison(
     target_effective = set(target_snapshot["effective_application_ids"])
     base_suspended = set(base_snapshot["suspended_application_ids"])
     target_suspended = set(target_snapshot["suspended_application_ids"])
+    base_windows = set(base_snapshot["active_blackout_window_ids"])
+    target_windows = set(target_snapshot["active_blackout_window_ids"])
 
     def in_scope(app_id: int) -> bool:
         return application_id is None or app_id == application_id
@@ -647,6 +905,21 @@ def build_revision_comparison(
         guard_band_changes.append(record)
         events.append(record)
 
+    blackout_window_events: list[dict[str, Any]] = []
+    for event in newer["blackout_window_events"]:
+        if event["revision"] <= older_revision:
+            continue
+        record = dict(event)
+        # Snapshot events already carry their own "type"/"kind"; normalise
+        # to enable/lift names for the combined stream.
+        record["type"] = (
+            "blackout_window_enable"
+            if event["kind"] == "enabled"
+            else "blackout_window_lift"
+        )
+        blackout_window_events.append(record)
+        events.append(record)
+
     events.sort(key=lambda event: event["revision"])
 
     interval_statuses = _snapshot_status_map(older)
@@ -692,6 +965,9 @@ def build_revision_comparison(
             "effective_application_ids": snapshot["effective_application_ids"],
             "suspended_application_ids": snapshot[
                 "suspended_application_ids"
+            ],
+            "active_blackout_window_ids": snapshot[
+                "active_blackout_window_ids"
             ],
         }
         if application_id is not None:
@@ -742,6 +1018,16 @@ def build_revision_comparison(
             "added_to_target": base_suspended_added,
             "removed_from_base": base_suspended_removed,
         },
+        "active_blackout_window_ids": {
+            "base": sorted(base_windows),
+            "target": sorted(target_windows),
+            "added": sorted(target_windows - base_windows),
+            "removed": sorted(base_windows - target_windows),
+            "added_to_target": sorted(target_windows - base_windows),
+            "removed_from_base": sorted(base_windows - target_windows),
+        },
+        "blackout_window_events": blackout_window_events,
+        "blackout_windows": blackout_window_events,
         "status_changes": status_changes,
         "approvals": approvals,
         "suspensions": suspensions,
@@ -841,6 +1127,9 @@ def current_revision() -> dict[str, Any]:
             serialize_waitlist_entry(session, entry, position)
             for position, entry in enumerate(load_waitlist(session), start=1)
         ]
+        active_windows = [
+            serialize_blackout_window(win) for win in load_active_windows(session)
+        ]
     return {
         "current_revision": revision,
         "guard_band": guard_band,
@@ -850,6 +1139,9 @@ def current_revision() -> dict[str, Any]:
         "suspended_applications": suspended_applications,
         "waitlist_application_ids": [e["application_id"] for e in waitlist_entries],
         "waitlist_entries": waitlist_entries,
+        "active_blackout_window_ids": [w["id"] for w in active_windows],
+        "active_blackout_windows": active_windows,
+        "blackout_window_events": snapshot["blackout_window_events"],
         "approvals": snapshot["approvals"],
         "suspensions": snapshot["suspensions"],
         "resumptions": snapshot["resumptions"],
@@ -1030,6 +1322,8 @@ def preview_application(application_id: int) -> dict[str, Any]:
         guard_band = meta.guard_band
         effective = load_effective_licenses(session)
         conflicts = adjudication.evaluate(to_license(row), effective, guard_band)
+        windows = [to_window_geometry(w) for w in load_active_windows(session)]
+        window_hits = window_hits_for(to_license(row), windows)
 
     return {
         "application_id": application_id,
@@ -1037,6 +1331,13 @@ def preview_application(application_id: int) -> dict[str, Any]:
         "guard_band": guard_band,
         "has_conflicts": bool(conflicts),
         "conflicts": [serialize_conflict(c, guard_band) for c in conflicts],
+        # Active spectrum control windows hit by this application; reports
+        # but does not block (previews never mutate).  Frequency endpoint
+        # touches hit; the guard band never extends a window.
+        "has_window_hits": bool(window_hits),
+        "hit_blackout_window_ids": [w.window_id for w in window_hits],
+        "window_hits": [serialize_window_hit(w) for w in window_hits],
+        "active_blackout_window_ids": [w.window_id for w in windows],
     }
 
 
@@ -1094,12 +1395,14 @@ def find_available_ranges(
         guard_band = meta.guard_band
         bandwidth = row.freq_high - row.freq_low
         effective = load_effective_licenses(session)
+        windows = [to_window_geometry(w) for w in load_active_windows(session)]
         ranges = adjudication.available_ranges(
             to_license(row),
             effective,
             guard_band,
             payload.candidate_low_min,
             payload.candidate_low_max,
+            windows,
         )
 
     return {
@@ -1109,6 +1412,7 @@ def find_available_ranges(
         "bandwidth": bandwidth,
         "candidate_low_min": payload.candidate_low_min,
         "candidate_low_max": payload.candidate_low_max,
+        "active_blackout_window_ids": [w.window_id for w in windows],
         "available_ranges": [
             {
                 "min": r.min,
@@ -1179,6 +1483,27 @@ def approve_application(
                 conflicts = adjudication.evaluate(
                     to_license(row), effective, guard_band
                 )
+
+                # Active control windows gate the write: a hit must never
+                # become effective (existing licenses are left untouched).
+                # Window hits take precedence in the error code while the
+                # ordinary interference conflicts are attached for detail.
+                windows = [
+                    to_window_geometry(w) for w in load_active_windows(session)
+                ]
+                window_hits = window_hits_for(to_license(row), windows)
+                if window_hits:
+                    raise blackout_error(
+                        f"application {application_id} hits "
+                        f"{len(window_hits)} active spectrum control "
+                        "window(s); frequency not granted",
+                        current,
+                        {application_id: window_hits},
+                        conflicts_by_application=(
+                            {application_id: conflicts} if conflicts else None
+                        ),
+                        guard_band=guard_band,
+                    )
                 if conflicts:
                     raise APIError(
                         E_INTERFERENCE,
@@ -1381,10 +1706,15 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                 ordered_rows = [rows_by_id[i] for i in payload.application_ids]
                 candidates = [to_license(row) for row in ordered_rows]
                 effective = load_effective_licenses(session)
+                windows = [
+                    to_window_geometry(w) for w in load_active_windows(session)
+                ]
                 against_effective, within_group = adjudication.evaluate_group(
                     candidates, effective, guard_band
                 )
                 interference_details = []
+                conflicts_by_candidate: dict[int, list] = {}
+                window_hit_details: dict[int, list] = {}
                 for candidate in candidates:
                     eff_conflicts = [
                         serialize_group_conflict(c, "effective", guard_band)
@@ -1394,13 +1724,37 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                         serialize_group_conflict(c, "group", guard_band)
                         for c in within_group[candidate.application_id]
                     ]
+                    raw_conflicts = (
+                        against_effective[candidate.application_id]
+                        + within_group[candidate.application_id]
+                    )
                     if eff_conflicts or group_conflicts:
+                        conflicts_by_candidate[
+                            candidate.application_id
+                        ] = raw_conflicts
                         interference_details.append(
                             {
                                 "application_id": candidate.application_id,
                                 "conflicts": eff_conflicts + group_conflicts,
                             }
                         )
+                    hits = window_hits_for(candidate, windows)
+                    if hits:
+                        window_hit_details[candidate.application_id] = hits
+                # Any window hit rejects the whole batch; the error reports
+                # the windows and, alongside them, every ordinary conflict
+                # for the blocked members.  A batch free of window hits keeps
+                # the original interference response shape.
+                if window_hit_details:
+                    raise blackout_error(
+                        f"{len(window_hit_details)} application(s) in the "
+                        "batch hit active spectrum control window(s); the "
+                        "whole batch was rejected and no frequency was granted",
+                        current,
+                        window_hit_details,
+                        conflicts_by_application=conflicts_by_candidate,
+                        guard_band=guard_band,
+                    )
                 if interference_details:
                     raise APIError(
                         E_INTERFERENCE,
@@ -1739,6 +2093,28 @@ def resume_application(
                 conflicts = adjudication.evaluate(
                     to_license(row), effective, guard_band
                 )
+
+                # Active control windows block a resumed license exactly as
+                # they block a new approval; the license stays suspended and
+                # no revision is consumed.  Window hits take precedence in
+                # the error code; interference conflicts come along too.
+                windows = [
+                    to_window_geometry(w) for w in load_active_windows(session)
+                ]
+                window_hits = window_hits_for(to_license(row), windows)
+                if window_hits:
+                    raise blackout_error(
+                        f"application {application_id} hits "
+                        f"{len(window_hits)} active spectrum control "
+                        "window(s); the license stays suspended and no "
+                        "revision was consumed",
+                        current,
+                        {application_id: window_hits},
+                        conflicts_by_application=(
+                            {application_id: conflicts} if conflicts else None
+                        ),
+                        guard_band=guard_band,
+                    )
                 if conflicts:
                     raise APIError(
                         E_INTERFERENCE,
@@ -2129,6 +2505,351 @@ def update_guard_band(payload: GuardBandUpdateRequest) -> dict[str, Any]:
                 E_STALE_REVISION,
                 f"the revision advanced concurrently (now {latest}); "
                 "re-preview and re-decide; the guard band was not changed",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Temporary spectrum control windows (rehearse -> enable -> lift)
+# --------------------------------------------------------------------------- #
+def _window_geometry_from_payload(payload) -> tuple:
+    return (
+        payload.circle.cx,
+        payload.circle.cy,
+        payload.circle.radius,
+        payload.frequency.low,
+        payload.frequency.high,
+        payload.time_window.start.astimezone(timezone.utc),
+        payload.time_window.end.astimezone(timezone.utc),
+    )
+
+
+def _window_preview(session, payload) -> dict[str, Any]:
+    """Shared non-mutating rehearsal used by preview and enable validation.
+
+    Returns the currently effective licenses and standby applications hit by
+    the proposed window, plus the current revision and guard band.
+    """
+    meta = session.get(RevisionMeta, 1)
+    current = meta.revision
+    guard_band = meta.guard_band
+
+    cx, cy, radius, f_low, f_high, start, end = _window_geometry_from_payload(
+        payload
+    )
+    candidate_window = BlackoutWindowGeometry(
+        window_id=0,
+        circle=Circle(cx, cy, radius),
+        freq_low=f_low,
+        freq_high=f_high,
+        start_time=start,
+        end_time=end,
+        enabled_revision=current,
+    )
+
+    effective = load_effective_licenses(session)
+    hit_licenses = [
+        lic
+        for lic in effective
+        if adjudication.window_hits_license(candidate_window, lic)
+    ]
+    waitlist_entries = load_waitlist(session)
+    positions = {
+        entry.id: position
+        for position, entry in enumerate(waitlist_entries, start=1)
+    }
+    hit_waitlist: list[dict[str, Any]] = []
+    for entry in waitlist_entries:
+        app_row = session.get(Application, entry.application_id)
+        if app_row is None or app_row.status != "pending":
+            continue
+        if adjudication.window_hits_license(
+            candidate_window, to_license(app_row)
+        ):
+            hit_waitlist.append(
+                {
+                    "application_id": app_row.id,
+                    "queue_position": positions[entry.id],
+                    "application": serialize_application(app_row),
+                }
+            )
+    return {
+        "current_revision": current,
+        "guard_band": guard_band,
+        "hit_effective_application_ids": [lic.application_id for lic in hit_licenses],
+        "hit_effective": [
+            {"application": _license_view(lic)} for lic in hit_licenses
+        ],
+        "hit_waitlist_application_ids": [h["application_id"] for h in hit_waitlist],
+        "hit_waitlist": hit_waitlist,
+        "hit_count": len(hit_licenses) + len(hit_waitlist),
+    }
+
+
+@app.post("/api/blackout-windows/preview", tags=["blackout-windows"])
+def preview_blackout_window(payload: BlackoutWindowPreviewRequest) -> dict[str, Any]:
+    """Rehearse a temporary spectrum control window without changing state.
+
+    Lists the currently effective licenses and standby (waitlisted)
+    applications the proposed window would hit, with the revision the
+    decision is based on.  A hit requires the coverage circle, half-open
+    UTC time span and closed frequency band to all intersect; frequency
+    endpoint touches count and the guard band never extends the window.
+    """
+    errors = validate_blackout_window(payload)
+    if errors:
+        raise APIError(
+            E_VALIDATION,
+            "the blackout window preview was rejected due to invalid fields",
+            status_code=422,
+            details=errors,
+        )
+    with SessionLocal() as session:
+        result = _window_preview(session, payload)
+    return {
+        "name": payload.name,
+        "circle": {
+            "cx": payload.circle.cx,
+            "cy": payload.circle.cy,
+            "radius": payload.circle.radius,
+        },
+        "frequency": {"low": payload.frequency.low, "high": payload.frequency.high},
+        "time_window": {
+            "start": iso(payload.time_window.start.astimezone(timezone.utc)),
+            "end": iso(payload.time_window.end.astimezone(timezone.utc)),
+        },
+        "reason": payload.reason,
+        **result,
+    }
+
+
+@app.post("/api/blackout-windows", status_code=201, tags=["blackout-windows"])
+def create_blackout_window(payload: BlackoutWindowCreateRequest) -> dict[str, Any]:
+    """Enable a rehearsed control window (conditional on expected revision).
+
+    Shares the singleton revision lock and sequence with every other writer
+    and consumes exactly one revision.  Enabling never touches existing
+    licenses: they remain effective, but starting with this revision all
+    previews/approvals/resumptions/waitlist auto-adjudications report and
+    enforce the new window.  Enabling does not itself approve any standby.
+    """
+    # Reuse the same whole-request geometry rules as an application.
+    errors = validate_blackout_window(payload)
+    if errors:
+        raise APIError(
+            E_VALIDATION,
+            "the blackout window was rejected due to invalid fields",
+            status_code=422,
+            details=errors,
+        )
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-preview and "
+                        "re-decide; the blackout window was not enabled",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                cx, cy, radius, f_low, f_high, start, end = (
+                    _window_geometry_from_payload(payload)
+                )
+                meta.revision = current + 1
+                win = BlackoutWindowRecord(
+                    name=payload.name,
+                    cx=cx,
+                    cy=cy,
+                    radius=radius,
+                    freq_low=f_low,
+                    freq_high=f_high,
+                    start_time=start,
+                    end_time=end,
+                    status="active",
+                    enabled_revision=meta.revision,
+                    enabled_reason=payload.reason,
+                )
+                session.add(win)
+                session.flush()
+                session.add(
+                    BlackoutWindowEvent(
+                        revision=meta.revision,
+                        window_id=win.id,
+                        kind="enabled",
+                        reason=payload.reason,
+                        cx=cx,
+                        cy=cy,
+                        radius=radius,
+                        freq_low=f_low,
+                        freq_high=f_high,
+                        start_time=start,
+                        end_time=end,
+                    )
+                )
+                preview = _window_preview(session, payload)
+                session.flush()
+                response = {
+                    "enabled": True,
+                    "window_id": win.id,
+                    "revision": meta.revision,
+                    "guard_band": meta.guard_band,
+                    "window": serialize_blackout_window(win),
+                    # The rehearsal is based on the pre-enable revision.
+                    "based_on_revision": current,
+                    **{
+                        k: v
+                        for k, v in preview.items()
+                        if k != "current_revision"
+                    },
+                }
+        except IntegrityError:
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-preview and re-decide; the blackout window was not enabled",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+@app.get("/api/blackout-windows", tags=["blackout-windows"])
+def list_blackout_windows(status: str | None = None) -> dict[str, Any]:
+    """List control windows (optional ``active``/``lifted`` filter)."""
+    with SessionLocal() as session:
+        query = session.query(BlackoutWindowRecord).order_by(
+            BlackoutWindowRecord.id
+        )
+        if status is not None:
+            if status not in {"active", "lifted"}:
+                raise APIError(
+                    E_VALIDATION,
+                    "status filter must be one of active, lifted",
+                    status_code=422,
+                )
+            query = query.filter(BlackoutWindowRecord.status == status)
+        rows = query.all()
+        meta = session.get(RevisionMeta, 1)
+        return {
+            "current_revision": meta.revision,
+            "window_count": len(rows),
+            "blackout_window_ids": [w.id for w in rows],
+            "windows": [serialize_blackout_window(w) for w in rows],
+        }
+
+
+@app.get("/api/blackout-windows/{window_id}", tags=["blackout-windows"])
+def get_blackout_window(window_id: int) -> dict[str, Any]:
+    with SessionLocal() as session:
+        row = session.get(BlackoutWindowRecord, window_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"blackout window {window_id} does not exist",
+                status_code=404,
+            )
+        return {"window": serialize_blackout_window(row)}
+
+
+@app.post(
+    "/api/blackout-windows/{window_id}/lift", tags=["blackout-windows"]
+)
+def lift_blackout_window(
+    window_id: int, payload: BlackoutWindowLiftRequest
+) -> dict[str, Any]:
+    """Release an active control window (conditional on expected revision).
+
+    Shares the singleton revision arbitration with every other writer and
+    consumes exactly one revision.  The lift only affects later decisions:
+    it does not itself approve any standby application.  An unknown window
+    is 404; lifting an already lifted window is 409 and consumes nothing.
+    """
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+
+                row = session.get(BlackoutWindowRecord, window_id)
+                if row is None:
+                    raise APIError(
+                        E_NOT_FOUND,
+                        f"blackout window {window_id} does not exist",
+                        status_code=404,
+                    )
+                if row.status != "active":
+                    raise APIError(
+                        E_BLACKOUT_WINDOW_NOT_ACTIVE,
+                        f"blackout window {window_id} is already lifted at "
+                        f"revision {row.lifted_revision}",
+                        status_code=409,
+                        details={
+                            "window_id": window_id,
+                            "status": row.status,
+                            "lifted_revision": row.lifted_revision,
+                        },
+                    )
+
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-decide; the "
+                        "blackout window was not lifted",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                meta.revision = current + 1
+                row.status = "lifted"
+                row.lifted_revision = meta.revision
+                row.lifted_reason = payload.reason
+                session.add(
+                    BlackoutWindowEvent(
+                        revision=meta.revision,
+                        window_id=row.id,
+                        kind="lifted",
+                        reason=payload.reason,
+                        cx=row.cx,
+                        cy=row.cy,
+                        radius=row.radius,
+                        freq_low=row.freq_low,
+                        freq_high=row.freq_high,
+                        start_time=row.start_time,
+                        end_time=row.end_time,
+                    )
+                )
+                session.flush()
+                response = {
+                    "lifted": True,
+                    "window_id": row.id,
+                    "revision": meta.revision,
+                    "enabled_revision": row.enabled_revision,
+                    "reason": payload.reason,
+                    "window": serialize_blackout_window(row),
+                }
+        except IntegrityError:
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-decide; the blackout window was not lifted",
                 status_code=409,
                 details={"current_revision": latest},
             )

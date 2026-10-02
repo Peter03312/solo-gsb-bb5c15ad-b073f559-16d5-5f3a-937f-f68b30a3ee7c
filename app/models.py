@@ -24,6 +24,16 @@ History is event-sourced:
                            standbys while the band is busy; registration and
                            cancellation consume no revision and the entry is
                            removed on approval (manual or automatic);
+* ``blackout_windows``    - temporary spectrum control windows (coverage
+                           circle, closed frequency band, half-open UTC time
+                           span) declared by operators; active from their
+                           enabled revision until lifted.  Enabling never
+                           touches existing licenses, but every later
+                           decision reports/enforces window hits;
+* ``blackout_window_events`` - append-only enable/lift records, one per
+                           revision, each snapshotting its window geometry so
+                           as-of snapshots restore the windows in force at
+                           any revision without rewriting older history;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -255,3 +265,99 @@ class RevisionMeta(Base):
     # GUARD_BAND environment variable; afterwards only changed through the
     # online config endpoint and never overwritten at startup.
     guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class BlackoutWindowRecord(Base):
+    """A temporary spectrum control window (operator-declared blackout).
+
+    The window is defined by the same geometry as an application: a
+    coverage circle, a closed frequency interval and a half-open UTC time
+    span.  A window *hits* an application/license exactly when all three
+    intersect (frequency endpoint touches count; the guard band never
+    extends a window).  Enabling a window does not touch already-effective
+    licenses; starting with its enabled revision, pending previews,
+    single/batch approvals, resumptions and post-release waitlist
+    auto-approvals report the windows they hit and write operations must
+    not make a hit license effective.
+
+    ``status`` is ``active`` after enable and ``lifted`` after a release.
+    Both transitions share the single revision sequence and consume one
+    revision each; lifting only affects later decisions and never triggers
+    waitlist re-adjudication.  The immutable transition history lives in
+    :class:`BlackoutWindowEvent`, so historical snapshots restore the
+    windows in force at any revision; original approval events are never
+    rewritten.
+    """
+
+    __tablename__ = "blackout_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    cx: Mapped[float] = mapped_column(Float, nullable=False)
+    cy: Mapped[float] = mapped_column(Float, nullable=False)
+    radius: Mapped[float] = mapped_column(Float, nullable=False)
+
+    freq_low: Mapped[float] = mapped_column(Float, nullable=False)
+    freq_high: Mapped[float] = mapped_column(Float, nullable=False)
+
+    start_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    end_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    # active -> lifted; lifting is terminal.
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", server_default="active"
+    )
+    enabled_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    lifted_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    enabled_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    lifted_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class BlackoutWindowEvent(Base):
+    """Append-only enable/lift record of a control window, one per revision.
+
+    Rows share the revision sequence with approvals, suspensions,
+    resumptions, revocations and guard-band changes (one revision per row).
+    Each row snapshots the window geometry so later window lifecycle
+    changes never rewrite earlier history and as-of snapshots can restore
+    the windows in force at any revision.
+    """
+
+    __tablename__ = "blackout_window_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    window_id: Mapped[int] = mapped_column(
+        ForeignKey("blackout_windows.id"), nullable=False
+    )
+    # "enabled" | "lifted"
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Geometry snapshot of the window this transition belongs to.
+    cx: Mapped[float] = mapped_column(Float, nullable=False)
+    cy: Mapped[float] = mapped_column(Float, nullable=False)
+    radius: Mapped[float] = mapped_column(Float, nullable=False)
+    freq_low: Mapped[float] = mapped_column(Float, nullable=False)
+    freq_high: Mapped[float] = mapped_column(Float, nullable=False)
+    start_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    end_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_blackout_window_events_window", "window_id"),
+    )

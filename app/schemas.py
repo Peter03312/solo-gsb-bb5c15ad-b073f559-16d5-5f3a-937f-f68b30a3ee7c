@@ -115,3 +115,43 @@ class WaitlistRegistrationRequest(BaseModel):
     # Register a pending application into the FIFO standby queue while the
     # band is busy.  The body is optional; ``reason`` is purely informational.
     reason: str = Field(default="", max_length=2000)
+
+
+class BlackoutWindowPreviewRequest(BaseModel):
+    # Dry-run a temporary spectrum control window against the current
+    # state: reports the effective licenses and standby applications the
+    # proposed window would hit, plus the current revision to carry into
+    # the enable call.  Never mutates state.
+    name: str | None = Field(default=None, max_length=200)
+    circle: CircleIn
+    frequency: FrequencyBandIn
+    time_window: TimeWindowIn
+    reason: str = Field(default="", max_length=2000)
+
+
+class BlackoutWindowCreateRequest(BaseModel):
+    # Rehearse-and-confirm a temporary spectrum control window.  The body
+    # carries the same geometry as an application (coverage circle, closed
+    # frequency band, half-open UTC time span), an optional reason and the
+    # expected revision for the confirmation.  Semantic checks (positive
+    # radius, ordered band/times, finite values, timezone-aware times) run
+    # in semantic_validation so they use the standard error envelope.
+    # carries the same geometry as an application (coverage circle, closed
+    # frequency band, half-open UTC time span), an optional reason and the
+    # expected revision for the confirmation.  Semantic checks (positive
+    # radius, ordered band/times, finite values, timezone-aware times) run
+    # in semantic_validation so they use the standard error envelope.
+    name: str | None = Field(default=None, max_length=200)
+    circle: CircleIn
+    frequency: FrequencyBandIn
+    time_window: TimeWindowIn
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=2000)
+
+
+class BlackoutWindowLiftRequest(BaseModel):
+    # Release a previously enabled control window.  Shares revision
+    # arbitration with every other writer; the lift consumes one revision,
+    # affects only later decisions and never triggers waitlist draining.
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=2000)

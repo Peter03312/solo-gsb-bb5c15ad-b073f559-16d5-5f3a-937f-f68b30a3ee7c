@@ -234,3 +234,77 @@ post "/api/applications/$X_ID/revoke" '{"reason":"moved away"}' | python3 -c 'im
 echo "== 37. resume C (revision 19): ordinary resume, never drains a queue =="
 post "/api/applications/$C_ID/resume" '{"expected_revision":18,"reason":"fault cleared"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("resumed revision", d["revision"], "; waitlist keys present:", "auto_approved_application_ids" in d)'
 curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("queue is now", d["waitlist_application_ids"], "at revision", d["current_revision"])'
+
+# --------------------------------------------------------------------------- #
+# Temporary spectrum control windows (self-contained, revisions read live)
+# ---------------------------------------------------------------------------
+cur_rev() { curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])'; }
+
+echo "== 38. control window: two fresh applications; approve P, queue Q =="
+P=$(post /api/applications '{
+  "name":"Patrol P",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":100,"high":110},
+  "time_window":{"start":"2026-11-01T08:00:00Z","end":"2026-11-01T12:00:00Z"}
+}')
+P_ID=$(echo "$P" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+Q=$(post /api/applications '{
+  "name":"Queue Q",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":105,"high":108},
+  "time_window":{"start":"2026-11-01T08:00:00Z","end":"2026-11-01T12:00:00Z"}
+}')
+Q_ID=$(echo "$Q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+R=$(post /api/applications '{
+  "name":"Remote R",
+  "circle":{"cx":9000,"cy":9000,"radius":10},
+  "frequency":{"low":105,"high":108},
+  "time_window":{"start":"2026-11-01T08:00:00Z","end":"2026-11-01T12:00:00Z"}
+}')
+R_ID=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+REV=$(cur_rev)
+post "/api/applications/$P_ID/approve" "{\"expected_revision\":$REV}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("P approved at revision", d["revision"])'
+post "/api/applications/$Q_ID/waitlist" '{"reason":"band busy"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("Q queued at position", d["queue_position"], "revision still", d["current_revision"])'
+
+echo "== 39. rehearse a window (hits effective P and standby Q; state unchanged) =="
+REV=$(cur_rev)
+post /api/blackout-windows/preview '{
+  "name":"VIP visit",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":104,"high":109},
+  "time_window":{"start":"2026-11-01T09:00:00Z","end":"2026-11-01T11:00:00Z"},
+  "reason":"state visit"
+}' | J
+echo "    boundary checks: frequency endpoint touch hits, a 1 MHz gap does not (guard band never extends a window):"
+post /api/blackout-windows/preview '{"circle":{"cx":0,"cy":0,"radius":1000},"frequency":{"low":110,"high":120},"time_window":{"start":"2026-11-01T09:00:00Z","end":"2026-11-01T11:00:00Z"}}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    band [110,120] touches P at 110 -> hits:", d["hit_effective_application_ids"])'
+post /api/blackout-windows/preview '{"circle":{"cx":0,"cy":0,"radius":1000},"frequency":{"low":111,"high":120},"time_window":{"start":"2026-11-01T09:00:00Z","end":"2026-11-01T11:00:00Z"}}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    band [111,120] only 1 MHz away -> hits:", d["hit_effective_application_ids"], "(guard band does not extend windows)")'
+post /api/blackout-windows/preview '{"circle":{"cx":0,"cy":0,"radius":-1},"frequency":{"low":200,"high":100},"time_window":{"start":"2026-11-01T11:00:00Z","end":"2026-11-01T09:00:00Z"}}' | J || true
+
+echo "== 40. stale enable refused; correct enable consumes one revision, P stays effective =="
+post /api/blackout-windows '{"name":"VIP visit","circle":{"cx":0,"cy":0,"radius":1000},"frequency":{"low":104,"high":109},"time_window":{"start":"2026-11-01T09:00:00Z","end":"2026-11-01T11:00:00Z"},"reason":"state visit","expected_revision":'$((REV-1))'}' | J || true
+WIN=$(post /api/blackout-windows '{"name":"VIP visit","circle":{"cx":0,"cy":0,"radius":1000},"frequency":{"low":104,"high":109},"time_window":{"start":"2026-11-01T09:00:00Z","end":"2026-11-01T11:00:00Z"},"reason":"state visit","expected_revision":'$REV'}')
+echo "$WIN" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("window", d["window_id"], "enabled at revision", d["revision"], "; hit effective", d["hit_effective_application_ids"], "and waitlist", d["hit_waitlist_application_ids"])'
+WIN_ID=$(echo "$WIN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["window_id"])')
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    P remains effective:", d["effective_application_ids"], "; active windows:", d["active_blackout_window_ids"])'
+
+echo "== 41. pending preview reports the hit; approving Q is refused (revision unchanged) =="
+post "/api/applications/$Q_ID/preview" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    Q has_window_hits:", d["has_window_hits"], "windows:", d["hit_blackout_window_ids"])'
+post "/api/applications/$Q_ID/approve" "{\"expected_revision\":$(cur_rev)}" | J || true
+echo "    R is outside the window circle and still approves normally:"
+post "/api/applications/$R_ID/approve" "{\"expected_revision\":$(cur_rev)}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    R approved at revision", d["revision"])'
+
+echo "== 42. available tuning positions exclude the window (closed endpoints) =="
+post "/api/applications/$Q_ID/available-ranges" '{"candidate_low_min":90,"candidate_low_max":130}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("   ", [(r["min"],r["max"],r["min_inclusive"],r["max_inclusive"]) for r in d["available_ranges"]])'
+
+echo "== 43. release P: Q blocked by the window keeps its queue place; drain continues =="
+post "/api/applications/$P_ID/revoke" '{"reason":"event over"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    revoke revision", d["revision"], "final", d["final_revision"], "auto-approved", d["auto_approved_application_ids"], "still queued", d["remaining_waitlist_application_ids"]); print("    pending window hits:", [h["window"]["id"] for h in d["waitlist_pending"][0]["window_hits"]])'
+
+echo "== 44. lift the window: one revision, affects only later decisions, Q stays queued =="
+post "/api/blackout-windows/$WIN_ID/lift" "{\"expected_revision\":$(cur_rev),\"reason\":\"visit ended\"}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    lifted at revision", d["revision"], "status:", d["window"]["status"])'
+post "/api/blackout-windows/$WIN_ID/lift" "{\"expected_revision\":$(cur_rev)}" | J || true
+curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    queue still:", d["waitlist_application_ids"], "(lift never auto-approves)")'
+
+echo "== 45. a later release now lets Q auto-approve; history restores the windows =="
+post "/api/applications/$R_ID/revoke" '{"reason":"event over"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    auto-approved", d["auto_approved_application_ids"], "final revision", d["final_revision"])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    window event log:", [(e["revision"],e["kind"]) for e in d["blackout_window_events"]])'
+curl -s "$BASE/api/blackout-windows" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    windows:", [(w["id"],w["status"],w["enabled_revision"],w["lifted_revision"]) for w in d["windows"]])'

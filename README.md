@@ -40,6 +40,17 @@
   修订号，响应列出本次自动获批与仍候补的申请 ID、未获批的冲突明细及最终修订号；
   释放失败或事务回滚时队列、许可与修订号均不变。历史按各修订号逐项还原自动审批
   结果（标记 `auto_approved` 与触发它的释放修订号）
+- **临时频谱管制窗口（禁用窗口）**：运营人员以**覆盖圆 + 频率闭区间 + UTC 左闭右开
+  时段 + 原因 + 预期修订号**先**预演**再**确认启用**一个临时禁用窗口；预演列出窗口
+  命中的当前有效许可与候补申请及所据修订号，**不改任何状态**。窗口与申请的圆、
+  半开时段、闭频段**三者都相交才算命中**（频段端点相碰算命中；**保护带宽不扩张
+  禁用范围**）。确认启用允许既有许可继续有效，但**自该修订起**：待审预览、单笔与
+  整组批准、暂停许可恢复、释放后的候补自动审批都**报告命中窗口**，且写操作不得使
+  命中许可生效（未命中者照常处理）。候补被阻止时**保留队列并继续检查后项**；
+  可用调频范围查询排除会命中的位置。启用与**解除**（凭窗口 ID + 预期修订号）与既有
+  写操作**共用同一修订号仲裁，各占一个修订号**；过期修订、无效窗口或非法范围一律
+  拒绝且不改许可、队列与修订号。解除**只影响后续裁决，不主动审批候补**。历史修订
+  查询与对比可还原当时生效的禁用窗口及启用/解除事件，原批准事件不追改
 
 ---
 
@@ -86,7 +97,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 124 个用例）：
+运行测试（自动使用临时 SQLite 库，共 169 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -230,6 +241,72 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 - 候补登记/取消虽不改修订号，但同样在单行修订号锁上排队，与释放事务串行，
   因此登记绝不会与正在进行的自动重裁互相穿插。
 
+### 临时频谱管制窗口（预演 → 启用 → 解除）
+
+临时管控某片区域的频谱时，运营人员用与申请相同的几何（覆盖圆、频率闭区间、
+UTC 左闭右开时段）声明一个**禁用窗口**，附原因与预期修订号，分两步操作：
+
+1. **预演** `POST /api/blackout-windows/preview`（请求体与申请同构，可附
+   `name` / `reason`）：返回当前修订号、窗口会**命中**的当前有效许可
+   （`hit_effective_application_ids` / `hit_effective`）与候补申请
+   （`hit_waitlist_application_ids` / `hit_waitlist`，含候补排队位置）。预演
+   **不改任何状态**。
+2. **确认启用** `POST /api/blackout-windows`：请求体在预演字段上追加
+   `expected_revision`。与单笔/整组批准、暂停、恢复、撤销、带宽变更**共用同一
+   把修订号锁与同一条修订号序列**，启用**恰好占一个修订号**；修订号过期 →
+   **409 `stale_revision`**，几何非法 → **422 `validation_failed`**（明细码与
+   申请一致：`radius_not_positive` / `frequency_low_above_high` /
+   `time_start_not_before_end` / `value_not_finite` / `naive_datetime`），两种
+   拒绝都**不占修订号、不改变许可与队列**。
+
+**命中判定**：窗口与申请（或许可）的覆盖圆、UTC 左闭右开时段、频率闭区间
+**三者都相交**才算命中——两圆相切、频段端点相碰（`110` 对 `[110,120]`）都算
+相交；一个时段结束恰为另一个开始（左闭右开）不算。**保护带宽不扩张禁用范围**：
+频段仅相邻（哪怕间隔小于当前保护带宽）不命中。
+
+**启用后的语义**
+
+- **既有许可继续有效**：启用不撤销、不暂停任何已生效许可；但自启用修订起：
+  - **待审预览** `preview` 追加 `has_window_hits` / `hit_blackout_window_ids` /
+    `window_hits`（只报告，不拦截，预览仍不改状态）与
+    `active_blackout_window_ids`；
+  - **单笔批准 / 整组批准**在锁内重裁时同时检查命中窗口：命中者一律**不得生效**，
+    返回 **409 `blackout_window_hit`**（`details.applications[]` 逐项给出
+    `window_hits`；若同时存在普通干扰，同一成员另附 `conflicts`）。整组时任一
+    成员命中则**整组不批准、修订号不变**；
+  - **暂停许可恢复** `resume` 同样重查命中窗口：命中则 409
+    `blackout_window_hit`，许可**保持暂停、不占修订号**；
+  - **释放后的候补自动审批**：暂停/撤销排空队列时，命中窗口的候补**保留排队
+    位置**，系统继续检查其后的候补（`waitlist_pending[]` 对每个未获批者同时
+    给出 `conflicts` 与 `window_hits`）；
+  - **未命中者照常处理**（普通干扰与修订号仲裁规则不变）。
+- **可用调频位置查询** `available-ranges` 把窗口作为额外障碍：候选下界禁区为
+  **闭**区间 `[窗口下界 − 频段宽度, 窗口上界]`（端点相碰即命中，故两端不可取），
+  与保护带宽的禁区合并取补集；保护带宽**不**为窗口扩展任何余量。
+- **写操作字段兼容**：既有响应字段与错误结构保持不变，命中信息均为**追加**字段
+  或使用新增错误码 `blackout_window_hit`。
+
+**解除**：`POST /api/blackout-windows/{id}/lift`，请求体
+`{"expected_revision": n, "reason": "可选"}`。与其它写操作共用修订号仲裁，
+解除**恰好占一个修订号**，**只影响后续裁决**：窗口从后续预览/批准/恢复/候补
+重裁中消失，但解除**本身不主动审批任何候补**（需等下一次暂停/撤销释放）。
+未知窗口 → **404 `not_found`**；重复解除已失效窗口 → **409
+`blackout_window_not_active`**（不占修订号）；修订号过期 → 409 `stale_revision`。
+
+**查询与历史**
+
+- `GET /api/blackout-windows?status=active|lifted` 列出窗口（可过滤）；
+  `GET /api/blackout-windows/{id}` 查单个窗口（含 `enabled_revision` /
+  `lifted_revision` / 状态 / 原因）。
+- `GET /api/revision/{n}` 追加还原**当时仍生效**的窗口
+  `active_blackout_window_ids` / `active_blackout_windows`，以及截至该修订的
+  不可变 `blackout_window_events`（`kind` 为 `enabled` / `lifted`，每条带窗口
+  几何快照）。`GET /api/revision/current` 同样追加当前生效窗口与事件流。
+- `GET /api/revision/compare` 追加 `active_blackout_window_ids`（两侧集合与
+  增删）与区间内的 `blackout_window_events` / `blackout_windows`（合并流
+  `differences` 中类型为 `blackout_window_enable` / `blackout_window_lift`）。
+  所有原批准事件（含其裁决带宽、`auto_approved` 等字段）**一律不追改**。
+
 ### 可用调频位置查询（不改状态）
 
 `POST /api/applications/{id}/available-ranges` 为**待审批**申请寻找可用调频位置：
@@ -252,7 +329,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 ### 修订号与并发模型
 
 - 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、暂停、恢复、撤销、
-  **保护带宽变更**或**释放时自动获批的每个候补申请**都使修订号 +1，并追加一条
+  **保护带宽变更**、**管制窗口启用 / 解除**或**释放时自动获批的每个候补申请**都使修订号 +1，并追加一条
   不可变事件（暂停/恢复因修订号过期或恢复互扰被拒绝时**不占**修订号；候补登记与
   取消也**不占**修订号）。候补自动批准与其触发释放同处一个事务：释放操作占一个
   修订号，每个自动获批申请占其后连续的一个修订号。
@@ -285,18 +362,23 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   还附完整的暂停中申请对象 `suspended_applications`）。候补自动获批的批准记录额外
   带 `auto_approved: true` 与 `release_revision`（触发它的暂停/撤销修订号），按其中
   任一修订号查询即可逐项还原自动审批；当前快照另附候补队列
-  `waitlist_application_ids` / `waitlist_entries`。
+  `waitlist_application_ids` / `waitlist_entries`。历史快照同时还原**当时仍生效的
+  管制窗口** `active_blackout_window_ids` / `active_blackout_windows` 及不可变的
+  `blackout_window_events`（`enabled` / `lifted`，带几何快照）；当前快照
+  （`GET /api/revision/current`）另附当前生效窗口。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、暂停、恢复、撤销记录、
-  **当时生效的保护带宽**及带宽变更记录（`n` 超过当前修订号返回 404）。
+  **当时生效的保护带宽、当时生效的管制窗口**及带宽/窗口变更记录
+  （`n` 超过当前修订号返回 404）。
 - `GET /api/revision/compare?base_revision={a}&target_revision={b}`
-  对两个已存在修订号做只读复核。返回两侧保护带宽、有效/暂停许可集合及增删集合、
+  对两个已存在修订号做只读复核。返回两侧保护带宽、有效/暂停许可集合、
+  **生效管制窗口集合**及增删集合、
   区间内按修订号排序的 `approval` / `suspension` / `resumption` / `revocation` /
-  `guard_band_change` 事件（合并字段为 `differences`；各类事件也分别在
+  `guard_band_change` / `blackout_window_enable` / `blackout_window_lift` 事件（合并字段为 `differences`；各类事件也分别在
   `approvals`、`suspensions`、`resumptions`、`revocations`、
-  `guard_band_changes` 中返回）、逐次 `status_changes`，其中审批事件保留
+  `guard_band_changes`、`blackout_window_events` 中返回）、逐次 `status_changes`，其中审批事件保留
   `auto_approved` 与 `release_revision`。可选 `application_id` 只筛选该申请的
-  许可事件（保护带宽变更仍返回）；未知申请返回 404。该接口只读取事件表，不修改
-  申请、许可、候补队列或修订号。
+  许可事件（保护带宽变更与管制窗口事件仍返回）；未知申请返回 404。该接口只读取事件表，不修改
+  申请、许可、候补队列、管制窗口或修订号。
 
 ### 保护带宽的在线调整
 
@@ -342,7 +424,12 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `POST` | `/api/applications/{id}/waitlist/cancel` | **取消候补**（不改申请状态、不占修订号） |
 | `GET` | `/api/waitlist` | 查询整条候补队列（FIFO）与当前修订号 |
 | `GET` | `/api/applications/{id}/waitlist` | 查询单个申请的候补位置 |
-| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 全部事件 |
+| `POST` | `/api/blackout-windows/preview` | **管制窗口预演**（命中的有效许可/候补与所据修订号；不改状态） |
+| `POST` | `/api/blackout-windows` | **确认启用管制窗口**（几何 + 原因 + 预期修订号；占一个修订号） |
+| `GET` | `/api/blackout-windows` | 管制窗口列表（可选 `status=active\|lifted`） |
+| `GET` | `/api/blackout-windows/{id}` | 查看单个管制窗口 |
+| `POST` | `/api/blackout-windows/{id}/lift` | **解除管制窗口**（窗口 ID + 预期修订号；占一个修订号，不主动审批候补） |
+| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 生效管制窗口 + 全部事件 |
 | `GET` | `/api/revision/compare` | 比较两个已存在修订号的带宽、许可集合、状态与按事件顺序的差异（只读） |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
 | `GET` | `/api/config/guard-band` | 当前生效带宽、初始带宽与当前修订号 |
@@ -358,9 +445,11 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
-| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`） |
-| 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID） |
+| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`）；**管制窗口几何非法**时明细码与申请相同（`radius_not_positive` / `frequency_low_above_high` / `time_start_not_before_end` / `value_not_finite` / `naive_datetime`） |
+| 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID）；**管制窗口不存在（启用预览之外的查询/解除）** |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
+| 409 | `blackout_window_hit` | **单笔/整组批准或暂停恢复命中当前生效的管制窗口**：写操作拒绝、许可不生效、修订号不变（整组时任一成员命中整组拒绝）；`details.applications[]` 逐项给 `window_hits`，同时存在普通干扰时同项附 `conflicts`。候补释放自动审批命中窗口时不报错，而是保留候补并继续检查后项（见 `waitlist_pending[].window_hits`） |
+| 409 | `blackout_window_not_active` | **重复解除一个已经解除的管制窗口**（`details.lifted_revision` 给出解除修订号；不占修订号） |
 | 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 / 对非待审批申请查询可用位置（整组时 `details.applications` 列出每项状态） |
 | 409 | `already_revoked` | 重复撤销（整组中混入已撤销申请时同样返回，明细同 `not_pending` 结构）；对已撤销许可暂停或恢复 |
 | 409 | `not_approved` | 对**待审批**申请暂停（只有已获批且未撤销的许可可以暂停） |
@@ -368,7 +457,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | 409 | `not_suspended` | 对未处于暂停状态的申请执行恢复（待审批/已获批均然，`details.status` 给出当前状态） |
 | 409 | `already_waitlisted` | 把同一申请**重复登记**为候补（`details.position` 给出当前位置） |
 | 409 | `not_waitlisted` | 取消一个**不在候补队列中**的申请（`details.status` 给出当前状态）；单项查询未登记申请时同码返回 **404** |
-| 409 | `stale_revision` | 修订号过期或被并发批准/暂停/恢复/撤销/带宽变更抢占（单笔/整组/暂停/恢复/带宽变更共享裁决） |
+| 409 | `stale_revision` | 修订号过期或被并发批准/暂停/恢复/撤销/带宽变更/**管制窗口启用或解除**抢占（单笔/整组/暂停/恢复/带宽变更/**窗口启用与解除**共享裁决） |
 | 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件）；或**恢复暂停许可时与当前有效许可互扰**，许可保持暂停（`details.conflicts` 附冲突对象，与单笔批准同构） |
 
 ---
@@ -999,7 +1088,173 @@ curl -s http://localhost:8000/api/revision/4
 
 脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
 （`./examples/walkthrough.sh http://localhost:8000`），其中第 26–31 步为
-暂停 / 恢复走查、第 32–37 步为候补队列完整走查。
+暂停 / 恢复走查、第 32–37 步为候补队列完整走查、第 38–45 步为
+临时频谱管制窗口完整走查。
+
+### 6.18 临时频谱管制窗口：预演 → 启用 → 阻断裁决 → 解除 → 历史还原
+
+设保护带宽 **2 MHz**、修订号 0。许可 P `[100,110]` 先在修订号 **1** 获批；
+待审申请 Q `[105,108]` 已登记为候补（与 P 同地同时段）。
+
+**第 1 步：预演窗口（不改状态）**——窗口频段 `[104,109]` 同时命中有效许可 P
+与候补 Q：
+
+```bash
+curl -s -X POST http://localhost:8000/api/blackout-windows/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "VIP visit",
+    "circle":    {"cx": 0, "cy": 0, "radius": 1000},
+    "frequency": {"low": 104, "high": 109},
+    "time_window": {"start": "2026-11-01T09:00:00Z", "end": "2026-11-01T11:00:00Z"},
+    "reason": "state visit"
+  }'
+```
+
+```json
+{"current_revision": 1, "guard_band": 2.0,
+ "hit_effective_application_ids": [1],
+ "hit_effective": [{"application": {"id": 1, ...}}],
+ "hit_waitlist_application_ids": [2],
+ "hit_waitlist": [{"application_id": 2, "queue_position": 1, ...}],
+ "hit_count": 2}
+```
+
+命中遵循三相交规则：频段 `[110,120]` 与 P 在 `110` **端点相碰 → 命中**；
+频段 `[111,120]` 虽与 P 只隔 1 MHz（< 保护带宽 2），但**保护带宽不扩张窗口
+→ 不命中**；时段左闭右开端点相接也不命中。
+
+**第 2 步：过期修订号被拒（不占修订号），正确启用占修订号 2，P 仍有效**
+
+```bash
+curl -i -X POST http://localhost:8000/api/blackout-windows \
+  -H 'Content-Type: application/json' \
+  -d '{ ...同上几何..., "expected_revision": 0}'
+# HTTP 409 {"error": {"code": "stale_revision",
+#   "details": {"expected_revision": 0, "current_revision": 1}}}
+
+curl -s -X POST http://localhost:8000/api/blackout-windows \
+  -H 'Content-Type: application/json' \
+  -d '{ ...同上几何..., "expected_revision": 1}'
+# {"enabled": true, "window_id": 1, "revision": 2,
+#  "window": {"id": 1, "status": "active", "enabled_revision": 2, ...},
+#  "hit_effective_application_ids": [1], "hit_waitlist_application_ids": [2], ...}
+```
+
+启用**不撤销 P**：`GET /api/revision/2` 中 `effective_application_ids` 仍含 1，
+`active_blackout_window_ids` 为 `[1]`。
+
+**第 3 步：待审预览报告命中；批准 Q 被 409 拒绝，修订号不变**
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/preview
+# {"current_revision": 2, "has_conflicts": true, ...,
+#  "has_window_hits": true, "hit_blackout_window_ids": [1],
+#  "window_hits": [{"window": {"id": 1, ...},
+#    "trigger": {"time_intersect": true, "area_intersect": true,
+#                "frequency_intersect": true}, "reason": "frequency_intersection"}],
+#  "active_blackout_window_ids": [1]}
+
+curl -i -X POST http://localhost:8000/api/applications/2/approve \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 2}'
+```
+
+```json
+HTTP/1.1 409 Conflict
+{"error": {"code": "blackout_window_hit",
+  "details": {"current_revision": 2,
+    "applications": [{"application_id": 2,
+      "window_hits": [{"window": {"id": 1, ...}, "trigger": {...}, ...}],
+      "conflicts": [ {"application": {"id": 1, ...}, ...} ]}]}}
+```
+
+整组批准混入命中成员同样整组拒绝、修订号不变（错误码同为
+`blackout_window_hit`，`details.applications[]` 逐项列出）；恢复一个命中窗口的
+暂停许可也返回该错误且许可保持暂停；**未命中窗口的申请照常获批**。
+
+**第 4 步：可用调频位置排除窗口（闭端点）**
+
+Q 频段宽度 3 MHz；窗口 `[104,109]` 对下界 `x` 的禁区是闭区间 `[101,109]`
+（端点 `101`、`109` 都不可取；保护带宽不为此扩展）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/available-ranges \
+  -H 'Content-Type: application/json' \
+  -d '{"candidate_low_min": 90, "candidate_low_max": 130}'
+# {"active_blackout_window_ids": [1], "available_ranges": [
+#   {"min": 90.0, "max": 101.0, "min_inclusive": true,  "max_inclusive": false},
+#   {"min": 109.0, "max": 130.0, "min_inclusive": false, "max_inclusive": true}]}
+```
+
+（若同时存在有效许可，保护带宽的**开**禁区会与窗口的**闭**禁区合并取补集，
+端点可取性按各自规则保留。）
+
+**第 5 步：释放 P——Q 被窗口拦下并保留候补，队列继续检查后项**
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/1/revoke \
+  -H 'Content-Type: application/json' -d '{"reason": "event over"}'
+# {"revoked": true, "revision": 3, "final_revision": 3,
+#  "auto_approved_application_ids": [],
+#  "remaining_waitlist_application_ids": [2],
+#  "waitlist_pending": [{"application_id": 2,
+#    "conflicts": [...], "window_hits": [{"window": {"id": 1}, ...}]}]}
+```
+
+**第 6 步：解除窗口（修订号 4）——只影响后续裁决，不主动审批候补**
+
+```bash
+curl -s -X POST http://localhost:8000/api/blackout-windows/1/lift \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 3, "reason": "visit ended"}'
+# {"lifted": true, "window_id": 1, "revision": 4,
+#  "enabled_revision": 2, "window": {"status": "lifted", "lifted_revision": 4, ...}}
+
+curl -s http://localhost:8000/api/waitlist
+# {"waitlist_application_ids": [2], ...}    <- Q 仍在候补，解除不触发自动审批
+```
+
+重复解除 → **409 `blackout_window_not_active`**（不占修订号）；未知窗口 → 404；
+解除携带过期修订号 → 409 `stale_revision`。下一次暂停/撤销释放时 Q 才会按
+常规规则参与候补重裁。
+
+**第 7 步：历史还原窗口与变动（原批准事件不追改）**
+
+```bash
+curl -s http://localhost:8000/api/revision/2
+# {"revision": 2, "active_blackout_window_ids": [1],
+#  "active_blackout_windows": [{"id": 1, "status": "active",
+#    "enabled_revision": 2, "frequency": {"low": 104.0, "high": 109.0}, ...}],
+#  "blackout_window_events": [{"revision": 2, "kind": "enabled",
+#    "window_id": 1, "window": {...}, "reason": "state visit"}],
+#  "approvals": [{"revision": 1, ...}]}    <- 原批准事件不变
+
+curl -s http://localhost:8000/api/revision/4
+# {"revision": 4, "active_blackout_window_ids": [],
+#  "blackout_window_events": [
+#    {"revision": 2, "kind": "enabled",  ...},
+#    {"revision": 4, "kind": "lifted", ...}]}
+
+curl -s "http://localhost:8000/api/revision/compare?base_revision=1&target_revision=4"
+# {"active_blackout_window_ids": {"base": [], "target": [], "added": [], "removed": []},
+#  "blackout_window_events": [
+#    {"revision": 2, "type": "blackout_window_enable", ...},
+#    {"revision": 4, "type": "blackout_window_lift", ...}], ...}
+```
+
+非法窗口几何（半径非正 / 频段倒置 / 时段倒置或无时区）在预演与启用时都按
+申请同款明细码 **422** 整笔拒绝，且**不占修订号、不改许可与队列**：
+
+```bash
+curl -i -X POST http://localhost:8000/api/blackout-windows \
+  -H 'Content-Type: application/json' \
+  -d '{"circle": {"cx": 0, "cy": 0, "radius": 0},
+       "frequency": {"low": 200, "high": 100},
+       "time_window": {"start": "2026-11-01T12:00:00Z", "end": "2026-11-01T09:00:00Z"},
+       "expected_revision": 4}'
+# HTTP 422 {"error": {"code": "validation_failed", "details": [
+#   {"field": "circle.radius", "code": "radius_not_positive", ...}, ...]}}
+```
 
 ---
 
@@ -1008,15 +1263,15 @@ curl -s http://localhost:8000/api/revision/4
 ```
 .
 ├── app/
-│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询与候补队列/释放自动重裁）
-│   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两、有效集成对检查与可用下界区间求解）
-│   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽与候选下界区间校验）
-│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest）
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽事件 + 候补队列 + 修订号/当前带宽）
+│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询、候补队列/释放自动重裁与临时管制窗口预演/启用/解除）
+│   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两、有效集成对检查、可用下界区间求解与管制窗口命中判定）
+│   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽、候选下界区间与管制窗口几何校验）
+│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest、BlackoutWindow*Request）
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽事件 + 候补队列 + 管制窗口及启用/解除事件 + 修订号/当前带宽）
 │   ├── db.py                   # 引擎、等待数据库、建表与旧库列升级、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封
-├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例）
+├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例与 test_blackout*.py 管制窗口用例）
 ├── examples/walkthrough.sh     # curl 走查脚本
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动
